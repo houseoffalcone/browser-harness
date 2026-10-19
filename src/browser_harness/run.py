@@ -321,6 +321,7 @@ def main():
 
 
 def _run(args):
+    _prefer_dedicated_chrome()  # which daemon every command below talks to
     if args and args[0] in {"-h", "--help"}:
         print(HELP)
         return
@@ -400,7 +401,6 @@ def _run(args):
     else:
         sys.exit(USAGE)
     print_update_banner()
-    _prefer_dedicated_chrome()
     # Auto-bootstrap a cloud browser is opt-in via BU_AUTOSPAWN — BROWSER_USE_API_KEY alone
     # is not enough, since the key is commonly set for unrelated reasons (profile sync,
     # cloud API calls, parent agents managing their own session). An explicit BU_CDP_URL

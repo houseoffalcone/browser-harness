@@ -498,7 +498,7 @@ class Daemon:
 
     def _acts_on(self, req, method, params, sid):
         """(target_id, known) for the tab a request would act on; known=False when it cannot be told."""
-        if method == "Target.closeTarget":
+        if method in ("Target.closeTarget", "Target.activateTarget"):
             return params.get("targetId"), True
         if method.startswith("Target."):
             return None, False  # browser-level
@@ -531,6 +531,14 @@ class Daemon:
                     refreshed = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
                     pages_by_id = {t["targetId"]: t for t in refreshed if t["type"] == "page"}
                     page = pages_by_id.get(self.target_id) or pages_by_id.get(self.dedicated_target_id)
+                    if page is None:
+                        # A previous run of this daemon (crash, kill) may have left its own tab open.
+                        for tid, rec in self.owned.items():
+                            if tid in pages_by_id and rec.get("task") == "daemon":
+                                page = pages_by_id[tid]
+                                self.dedicated_target_id = tid
+                                log(f"named daemon {NAME}: reusing its tab ({tid})")
+                                break
                     if page is None:
                         tid = (await self.cdp.send_raw(
                             "Target.createTarget", {"url": "about:blank", "background": True}

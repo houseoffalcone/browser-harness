@@ -66,6 +66,26 @@ def test_guard_closes_only_owned_tabs_and_forgets_them():
     assert "result" in ok and "mine" not in d.owned
 
 
+def test_guard_refuses_to_foreground_a_tab_the_harness_did_not_open():
+    d = _daemon(current="mine")
+    d.own("mine")
+    assert "refused" in _handle(d, {"method": "Target.activateTarget", "params": {"targetId": "user-tab"}})["error"]
+    assert "result" in _handle(d, {"method": "Target.activateTarget", "params": {"targetId": "mine"}})
+
+
+def test_named_daemon_reuses_its_own_tab_after_an_ungraceful_restart(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "claude")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+    d = _daemon(targets=[
+        {"targetId": "user-tab", "url": "https://user/", "type": "page"},
+        {"targetId": "left-over", "url": "about:blank", "type": "page"},
+    ])
+    d.own("left-over")  # task "daemon": the previous run's dedicated tab
+    page = asyncio.run(d.attach_first_page())
+    assert page["targetId"] == "left-over" and d.dedicated_target_id == "left-over" and d.cdp.created == 0
+
+
 def test_allow_user_tabs_flag_bypasses_the_guard():
     d = _daemon(current="user-tab")
     r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "allow_user_tabs": True})
@@ -338,6 +358,20 @@ def test_prefer_dedicated_chrome_is_a_noop_when_it_is_down_or_configured(monkeyp
     monkeypatch.delenv("BU_CDP_URL")
     monkeypatch.setenv("BU_NAME", "worker")
     assert run._prefer_dedicated_chrome() is None and "BU_CDP_URL" not in run.os.environ
+
+
+def test_reload_stops_the_daemon_the_scripts_actually_use(monkeypatch):
+    """`browser-harness --reload` with the dedicated Chrome up must stop the `claude` daemon."""
+    import sys
+    from unittest.mock import patch
+    _reset_names(monkeypatch)
+    monkeypatch.setenv("BH_PREFER_CDP_URL", "http://127.0.0.1:9223")
+    monkeypatch.setattr(run, "_devtools_alive", lambda url: True)
+    seen = []
+    with patch.object(sys, "argv", ["browser-harness", "--reload"]), \
+         patch("browser_harness.run.restart_daemon", side_effect=lambda: seen.append(admin.NAME)):
+        run._run(["--reload"])
+    assert seen == ["claude"]
 
 
 def test_prefer_dedicated_chrome_disabled_by_empty_url(monkeypatch):
