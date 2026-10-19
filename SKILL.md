@@ -28,13 +28,22 @@ PY
 - First navigation for a task is `new_tab(url)`, not `goto_url(url)`. The daemon
   preserves the attached tab across separate CLI invocations, so do not call
   `new_tab()` again in every script.
-- Keep one working tab per task/site. Before opening another, inspect
-  `current_tab()` and `list_tabs()` and use `switch_tab()` to reuse a matching
-  tab. Do not leave duplicate tabs on the same URL or close tabs you did not
-  create.
-- At task completion, close tabs created for the task that are no longer needed.
-  Keep a tab open if the user needs to see it, it is needed for a known follow-up,
-  or closing it could discard unsaved work or other important state.
+- **The harness only acts on tabs it opened.** The daemon keeps a registry of the
+  tabs `new_tab()` created (it survives `--reload`) and refuses clicks, typing,
+  navigation, JS and `close_tab()` on any other tab with
+  `refused: tab … was not opened by the harness`. That error means: open your own
+  tab with `new_tab(url)`. `list_tabs()` shows `owned` per tab; `owned_tabs()`
+  lists yours. Set `BH_ALLOW_USER_TABS=1` only when the user explicitly asks you
+  to work inside a tab they opened.
+- Keep one working tab per task/site. Set `BH_TASK=<slug>` for every call of one
+  task; `new_tab(url)` then reuses that task's tab on the same site (or any blank
+  tab it owns) instead of piling up duplicates — `new_tab(url, reuse=False)` when
+  you really need a second tab. Do not leave duplicate tabs on the same URL.
+- At task completion call `close_task_tabs()`. It closes the tabs this task
+  opened — only those — and only when each still sits on a site the harness sent
+  it to; a tab that was navigated elsewhere (a login redirect, the user browsing
+  in it) stays open and is returned under `kept` with the reason. Keep a tab open
+  on purpose when the user needs to see it or a follow-up needs it.
 - `new_tab()` and `switch_tab()` attach and move the horse marker without
   changing Chrome's visible tab. Screenshots and normal CDP input work in the
   background. Never call `activate_tab(target)` automatically: it brings Chrome
@@ -56,6 +65,13 @@ PY
   activating the tab. Do not invent a `Runtime.evaluate` scroll replacement or
   a cross-frame JS walker.
 - The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
+- A dedicated agent Chrome wins when it is up: with nothing configured, the CLI
+  probes `BH_PREFER_CDP_URL` (default `http://127.0.0.1:9223`, a Chrome launched
+  with its own `--user-data-dir` and `--remote-debugging-port=9223`) and, if it
+  answers, runs as `BU_NAME=claude` against it — its own daemon, its own tab,
+  never the user's Chrome. When nothing listens there it falls back to the normal
+  discovery. `BU_CDP_URL`, `BU_CDP_WS` or `BU_NAME` set explicitly disable the
+  probe; `BH_PREFER_CDP_URL=""` turns it off.
 
 ## Local Chrome
 
@@ -186,7 +202,9 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 - Clicking: AX node -> box center -> `click_at_xy(x, y)` -> verify with a targeted `js(...)`/`page_info()` check.
 - Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
 - After navigation, call `wait_for_load()`.
-- If the current tab is stale or internal, call `ensure_real_tab()`.
+- If the current tab is stale or internal, call `ensure_real_tab()`. It attaches
+  to a tab the harness owns (or opens a fresh background one) — never to a tab the
+  user opened.
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
 - When entering unusually long text, avoid slow per-character typing: find a faster page-appropriate input method, then verify the page kept the exact value.
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.

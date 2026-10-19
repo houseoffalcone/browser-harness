@@ -114,6 +114,7 @@ def test_tab_marker_can_be_disabled_before_set_session_schedules_it(monkeypatch,
 def test_tab_marker_stays_enabled_by_default(monkeypatch):
     monkeypatch.delenv("BH_TAB_MARKER", raising=False)
     d = _fresh_daemon()
+    d.own("target-with-marker")  # the marker only lands on tabs the harness owns
 
     async def run():
         await d.handle({
@@ -724,6 +725,7 @@ def test_delayed_stale_request_follows_recovery_during_domain_enable(monkeypatch
         d.cdp.release_enables = asyncio.Event()
         d.session = "stale-session"
         d.target_id = "same-tab"
+        d.own("same-tab")  # the harness only acts on tabs it opened
 
         slow = asyncio.create_task(d.handle({
             "method": "Runtime.evaluate", "params": {"expression": "slow"}
@@ -788,6 +790,7 @@ def test_tab_switch_waits_for_recovery_and_keeps_old_action_on_old_tab(monkeypat
         d.cdp.release_discovery = asyncio.Event()
         d.session = "old-session"
         d.target_id = "old-tab"
+        d.own("old-tab")  # the harness only acts on tabs it opened
 
         request = asyncio.create_task(d.handle({
             "method": "Runtime.evaluate",
