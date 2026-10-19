@@ -7,12 +7,18 @@ Use **CDP for control**, **UI automation for user-visible order**.
 ```python
 tabs = list_tabs()                    # includes chrome:// pages too
 real_tabs = list_tabs(include_chrome=False)
-tid = new_tab("https://example.com")  # create + attach in the background
+tid = new_tab("https://example.com")  # reuse this task's tab on that site, else create + attach in the background
 switch_tab(tid)                       # attach harness, move the horse marker
 activate_tab(tid)                     # optional: explicitly show it in Chrome
 print(current_tab())
 print(page_info())
+print(owned_tabs())                   # the tabs this task (BH_TASK) opened, with where the harness sent them
+print(close_task_tabs())              # task end: close those — after a URL check — and report what was kept
 ```
+
+Ownership: the daemon only lets you act on tabs the harness opened (`list_tabs()`
+shows `owned`). Anything else answers `refused: tab … was not opened by the harness`
+— open your own with `new_tab()`. `BH_ALLOW_USER_TABS=1` is the explicit override.
 
 What CDP is good at:
 - attach to a tab
@@ -62,6 +68,7 @@ Typical tools:
 ## Rules that held up in practice
 
 - `switch_tab()` intentionally does **not** change Chrome's visible tab.
+- `close_tab()` / `close_task_tabs()` never close a tab the harness did not open; `close_task_tabs()` also leaves a tab alone when it no longer sits on a site the harness sent it to (login hops, the user browsing in it) and tells you why.
 - Static screenshots and normal CDP input work on the attached background tab.
 - `activate_tab()` is only for a user-requested visible switch. Rendering or
   input trouble is not permission to foreground Chrome; use background CDP and

@@ -38,6 +38,12 @@ _load_env()
 NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
+# Tabs the harness opens are registered to this task; close_task_tabs() closes them at the end.
+TASK = os.environ.get("BH_TASK", "default")
+# The daemon refuses to act on a tab the harness did not open unless this is set.
+ALLOW_USER_TABS = os.environ.get("BH_ALLOW_USER_TABS", "").strip().lower() in {"1", "true", "yes", "on"}
+BLANK_URLS = ("", "about:blank", "data:text/html,")
+NEW_TAB_PAGES = ("about:blank#", "chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab")
 IPC_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = 5.0
 # Cloud screenshots routinely take longer than ordinary CDP round trips. Keep
@@ -50,6 +56,8 @@ class _IPCResponseTimeout(TimeoutError):
 
 
 def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+    if ALLOW_USER_TABS:
+        req = {**req, "allow_user_tabs": True}
     c, token = ipc.connect(NAME, timeout=IPC_CONNECT_TIMEOUT_SECONDS)
     try:
         c.settimeout(response_timeout)
@@ -362,6 +370,8 @@ def _is_agent_startup_placeholder(title, url):
 
 
 def list_tabs(include_chrome=True):
+    """Every page tab. `owned` marks the tabs the harness opened — the only ones it may act on."""
+    owned = {t["targetId"] for t in owned_tabs(None)}
     out = []
     for t in cdp("Target.getTargets")["targetInfos"]:
         if t["type"] != "page": continue
@@ -373,8 +383,20 @@ def list_tabs(include_chrome=True):
             "target_id": t["targetId"],
             "title": t.get("title", ""),
             "url": url,
+            "owned": t["targetId"] in owned,
         })
     return out
+
+def owned_tabs(task=TASK):
+    """Tabs the harness opened that are still open, with their current url/title and the urls the
+    harness sent them to. Defaults to this task (BH_TASK); task=None lists every task's tabs."""
+    return _send({"meta": "owned_tabs", "task": task}).get("tabs", [])
+
+def _host(url):
+    return (urlparse(url).hostname or "").removeprefix("www.")
+
+def _is_blankish(url):
+    return url in BLANK_URLS or url.startswith(NEW_TAB_PAGES)
 
 def current_tab():
     r = _send({"meta": "current_tab"})
@@ -426,52 +448,76 @@ def switch_tab(target, activate=False):
     _mark_tab()
     return sid
 
-def new_tab(url="about:blank"):
+def new_tab(url="about:blank", reuse=True):
+    """Open `url` in a tab the harness owns, in the background: Chrome's visible tab never changes.
+
+    reuse=True (default) first reuses this task's own tab on the same site, then any blank tab the
+    harness owns, so a task keeps one tab per site instead of piling up duplicates. reuse=False
+    always creates a tab. Every tab returned here is registered to BH_TASK and is what
+    close_task_tabs() closes at the end."""
+    if reuse:
+        same_site = [t for t in owned_tabs() if url != "about:blank" and _host(t["url"]) == _host(url)]
+        blank = [t for t in owned_tabs(None) if _is_blankish(t["url"])]
+        pick = (same_site or blank or [None])[-1]
+        if pick:
+            _send({"meta": "own_tab", "target_id": pick["targetId"], "task": TASK})
+            switch_tab(pick["targetId"])
+            if url != "about:blank":
+                goto_url(url)
+            return pick["targetId"]
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
     # polls and wait_for_load() returns before navigation actually starts.
-    if url != "about:blank":
-        try:
-            cur = current_tab()
-            cur_url = cur.get("url") or ""
-            # Reuse attached tab when it's blank
-            if (
-                cur_url in ("", "about:blank", "data:text/html,")
-                or cur_url.startswith("about:blank#")
-                or cur_url.startswith(("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab"))
-            ):
-                goto_url(url)
-                return cur.get("targetId") or cur.get("target_id")
-        except Exception:
-            pass
     tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+    _send({"meta": "own_tab", "target_id": tid, "task": TASK})
     switch_tab(tid)
     if url != "about:blank":
         goto_url(url)
     return tid
 
 def close_tab(target=None):
-    """Close a tab. If `target` is omitted, closes the currently attached tab.
-    Accepts a raw targetId string or a dict from list_tabs()/current_tab()."""
+    """Close a tab the harness opened. If `target` is omitted, closes the currently attached tab.
+    Accepts a raw targetId string or a dict from list_tabs()/current_tab(). The daemon refuses
+    tabs the harness did not open."""
     target_id = _target_id(target)
     if target_id is None:
         target_id = current_tab()["targetId"]
     cdp("Target.closeTarget", targetId=target_id)
 
+def close_task_tabs(task=TASK):
+    """Task end: close the tabs this task opened — only those, and only when each still sits on a
+    site the harness sent it to. A tab that was navigated elsewhere (a login redirect, the user
+    browsing in it) is left open and reported. Returns {"closed": [ids], "kept": [{targetId, url, reason}]}."""
+    out = {"closed": [], "kept": []}
+    for t in owned_tabs(task):
+        sent_to = {_host(u) for u in t.get("urls", []) if _host(u)}
+        now = _host(t["url"])
+        on_site = now in sent_to or any(now.endswith("." + h) for h in sent_to)
+        if _is_blankish(t["url"]) or on_site:
+            cdp("Target.closeTarget", targetId=t["targetId"])
+            out["closed"].append(t["targetId"])
+        else:
+            out["kept"].append({"targetId": t["targetId"], "url": t["url"],
+                                "reason": f"now on {now or t['url']}; the harness only sent it to {sorted(sent_to)}"})
+    return out
+
 
 def ensure_real_tab():
-    """Switch to a real user tab if current is chrome:// / internal / stale."""
-    tabs = list_tabs(include_chrome=False)
-    if not tabs:
-        return None
+    """Attach to a tab the harness owns: the current one if it is a real owned page, else the newest
+    owned real page, else a fresh background tab registered to BH_TASK. Never a tab the user opened."""
+    mine = owned_tabs(None)
     try:
         cur = current_tab()
-        if cur["url"] and not cur["url"].startswith(INTERNAL):
+        if cur["url"] and not cur["url"].startswith(INTERNAL) and any(t["targetId"] == cur["targetId"] for t in mine):
             return cur
     except Exception:
         pass
-    switch_tab(tabs[0]["targetId"])
-    return tabs[0]
+    real = [t for t in mine if t["url"] and not t["url"].startswith(INTERNAL)]
+    if real:
+        switch_tab(real[-1]["targetId"])
+        return real[-1]
+    tid = new_tab()
+    return {"targetId": tid, "target_id": tid, "url": "about:blank", "title": ""}
 
 def iframe_target(url_substr):
     """First iframe target whose URL contains `url_substr`. Use with js(..., target_id=...)."""

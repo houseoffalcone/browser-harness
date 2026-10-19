@@ -494,12 +494,15 @@ def test_new_tab_creates_and_attaches_in_background(monkeypatch):
 
 
 def test_new_tab_reuses_an_empty_data_document(monkeypatch):
+    """A blank tab the harness owns (any task) is reused instead of creating another."""
     calls = []
     monkeypatch.setattr(
         helpers,
-        "current_tab",
-        lambda: {"targetId": "target-placeholder", "url": "data:text/html,"},
+        "owned_tabs",
+        lambda task=helpers.TASK: [{"targetId": "target-placeholder", "url": "data:text/html,", "task": "daemon", "urls": []}],
     )
+    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
+    monkeypatch.setattr(helpers, "switch_tab", lambda target: calls.append(("switch_tab", target)))
     monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto_url", url)))
     monkeypatch.setattr(
         helpers,
@@ -508,7 +511,10 @@ def test_new_tab_reuses_an_empty_data_document(monkeypatch):
     )
 
     assert helpers.new_tab("https://example.com") == "target-placeholder"
-    assert calls == [("goto_url", "https://example.com")]
+    assert ("ipc", {"meta": "own_tab", "target_id": "target-placeholder", "task": helpers.TASK}) in calls
+    assert ("switch_tab", "target-placeholder") in calls
+    assert ("goto_url", "https://example.com") in calls
+    assert not any(method == "Target.createTarget" for method, _ in calls if method != "ipc")
 
 
 # --- press_key physical key identity (#685) ---

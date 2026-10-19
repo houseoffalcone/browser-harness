@@ -117,4 +117,10 @@ browser-harness --update -y
 browser-harness telemetry disable
 ```
 
-State lives under `${XDG_CONFIG_HOME:-~/.config}/browser-harness` by default: auth, telemetry id, agent workspace, runtime sockets, logs, screenshots, and temp files. Override with `BH_HOME` or `BROWSER_HARNESS_HOME`.
+State lives under `${XDG_CONFIG_HOME:-~/.config}/browser-harness` by default: auth, telemetry id, agent workspace, runtime sockets, logs, screenshots, and temp files. Override with `BH_HOME` or `BROWSER_HARNESS_HOME`. The owned-tab registry is `runtime/owned-<BU_NAME>.json` there.
+
+Tab-hygiene environment:
+
+- `BH_TASK` — the task the tabs you open belong to (default `default`); `new_tab()` reuses that task's tab per site and `close_task_tabs()` closes that task's tabs.
+- `BH_ALLOW_USER_TABS=1` — let this invocation act on tabs the harness did not open (the daemon refuses otherwise).
+- `BH_PREFER_CDP_URL` — a dedicated agent Chrome to prefer when it answers (default `http://127.0.0.1:9223`; empty string disables the probe); `BH_PREFER_NAME` is the daemon name it runs as (default `claude`).

@@ -29,7 +29,7 @@ from .admin import (
     stop_remote_daemon,
     sync_local_profile,
 )
-from . import auth, recorder, telemetry
+from . import admin, auth, helpers, recorder, telemetry
 from .helpers import *
 
 HELP = """Browser Harness
@@ -79,16 +79,35 @@ USAGE = """Usage:
 # Probe /json/version (not a bare TCP connect) so a non-Chrome process bound to
 # 9222/9223 doesn't masquerade as Chrome and skip the cloud bootstrap. Mirrors
 # daemon.py's fallback probe.
+def _devtools_alive(url):
+    try:
+        with urllib.request.urlopen(f"{url.rstrip('/')}/json/version", timeout=0.3) as response:
+            version = json.loads(response.read())
+        return isinstance(version, dict) and isinstance(version.get("webSocketDebuggerUrl"), str) and bool(version["webSocketDebuggerUrl"])
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _local_chrome_listening():
-    for port in (9222, 9223):
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.3) as response:
-                version = json.loads(response.read())
-            if isinstance(version, dict) and isinstance(version.get("webSocketDebuggerUrl"), str) and version["webSocketDebuggerUrl"]:
-                return True
-        except (OSError, TypeError, ValueError):
-            pass
-    return False
+    return any(_devtools_alive(f"http://127.0.0.1:{port}") for port in (9222, 9223))
+
+
+# A dedicated agent Chrome (its own profile, launched with --remote-debugging-port, default
+# http://127.0.0.1:9223) wins over the user's own Chrome whenever it is up and nothing was
+# configured explicitly: the daemon runs as BU_NAME "claude" with its own dedicated tab, so
+# the user's tabs are never attached to. Set BH_PREFER_CDP_URL="" to disable the probe.
+def _prefer_dedicated_chrome():
+    if _explicit_cdp_configured() or os.environ.get("BU_NAME"):
+        return None
+    url = os.environ.get("BH_PREFER_CDP_URL", "http://127.0.0.1:9223").rstrip("/")
+    if not url or not _devtools_alive(url):
+        return None
+    name = os.environ.get("BH_PREFER_NAME", "claude")
+    os.environ["BU_CDP_URL"] = url
+    os.environ["BU_NAME"] = name
+    global NAME
+    NAME = admin.NAME = helpers.NAME = name
+    return name
 
 
 # BU_CDP_URL / BU_CDP_WS are documented to override local Chrome discovery
@@ -381,6 +400,7 @@ def _run(args):
     else:
         sys.exit(USAGE)
     print_update_banner()
+    _prefer_dedicated_chrome()
     # Auto-bootstrap a cloud browser is opt-in via BU_AUTOSPAWN — BROWSER_USE_API_KEY alone
     # is not enough, since the key is commonly set for unrelated reasons (profile sync,
     # cloud API calls, parent agents managing their own session). An explicit BU_CDP_URL
