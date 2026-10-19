@@ -116,6 +116,25 @@ def test_registry_survives_a_daemon_restart():
     assert again.owned["kept"]["task"] == "t" and again.owned["kept"]["urls"] == ["https://a/"]
 
 
+def test_raw_create_target_is_owned_with_the_request_task():
+    d = _daemon(current="mine")
+    d.own("mine")
+    r = _handle(d, {"method": "Target.createTarget", "params": {"url": "about:blank", "background": True}, "task": "t"})
+    assert r["result"]["targetId"] == "created-1" and d.owned["created-1"]["task"] == "t"
+
+
+def test_marker_is_never_scheduled_for_a_tab_the_harness_does_not_own():
+    async def run():
+        d = _daemon(current="user-tab")
+        assert d._schedule_tab_marker("s") is None
+        d.own("user-tab")
+        task = d._schedule_tab_marker("s")
+        await task
+        return d
+    d = asyncio.run(run())
+    assert any(m == "Runtime.evaluate" for m, _p, _s in d.cdp.calls)
+
+
 # --- recovery never lands on the user's page when the harness has a tab ---
 
 def test_default_recovery_stays_on_the_current_tab_when_it_still_exists(monkeypatch):
@@ -142,6 +161,43 @@ def test_default_recovery_prefers_an_owned_page_over_the_users_first_page(monkey
     page = asyncio.run(d.attach_first_page())
     assert page["targetId"] == "mine"
     assert "user-tab" not in d.owned
+
+
+def test_daemon_does_not_own_a_users_blank_or_new_tab_page_but_owns_cloud_pages(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "default")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+    d = _daemon(targets=[{"targetId": "user-blank", "url": "chrome://newtab/", "type": "page"}])
+    asyncio.run(d.attach_first_page())
+    assert d.target_id == "user-blank" and "user-blank" not in d.owned
+    monkeypatch.setattr(daemon, "REMOTE_ID", "cloud-browser")
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cloud")
+    d = _daemon(targets=[{"targetId": "cloud-blank", "url": "about:blank", "type": "page"}])
+    asyncio.run(d.attach_first_page())
+    assert "cloud-blank" in d.owned
+
+
+def test_recovery_never_replays_a_request_on_a_users_page(monkeypatch):
+    """The owned tab was closed; the only page left is the user's. Recovery may attach
+    there (nothing else exists) but the pending click/JS must not run on it."""
+    monkeypatch.setattr(daemon, "NAME", "default")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+
+    class _StaleCDP(_CDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            if method == "Runtime.evaluate" and session_id == "session-current":
+                self.calls.append((method, params, session_id))
+                raise RuntimeError("Session with given id not found")
+            return await super().send_raw(method, params, session_id)
+
+    d = _daemon(targets=[{"targetId": "user-tab", "url": "https://user/", "type": "page"}], current="mine-closed")
+    d.cdp = _StaleCDP(d.cdp.targets)
+    d.own("mine-closed")
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "click()"}})
+    assert "refused" in r["error"] and "user-tab" in r["error"]
+    assert d.target_id == "user-tab"
+    assert not any(m == "Runtime.evaluate" and s == "session-for-user-tab" for m, _p, s in d.cdp.calls)
 
 
 def test_daemon_owns_the_blank_tab_it_creates_but_not_a_users_page(monkeypatch):
@@ -186,8 +242,19 @@ def test_new_tab_creates_and_registers_when_nothing_matches(monkeypatch):
     _fake_helpers(monkeypatch, [{"targetId": "t1", "url": "https://instagram.com/", "task": helpers.TASK, "urls": []}], calls)
     assert helpers.new_tab("https://linkedin.com/") == "created"
     assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
-    assert ("ipc", {"meta": "own_tab", "target_id": "created", "task": helpers.TASK}) in calls
     assert not any(c[0] == "Target.activateTarget" for c in calls)
+
+
+def test_every_request_carries_the_task_so_created_targets_are_registered(monkeypatch):
+    seen = []
+
+    class _Sock:
+        def settimeout(self, t): pass
+        def close(self): pass
+    monkeypatch.setattr(helpers.ipc, "connect", lambda name, timeout: (_Sock(), None))
+    monkeypatch.setattr(helpers.ipc, "request", lambda c, token, req: seen.append(req) or {"result": {}})
+    helpers.cdp("Target.createTarget", url="about:blank")
+    assert seen[0]["task"] == helpers.TASK
 
 
 def test_new_tab_reuse_false_always_creates(monkeypatch):

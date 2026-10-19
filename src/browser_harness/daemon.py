@@ -491,6 +491,11 @@ class Daemon:
             for tid, rec in self.owned.items() if task is None or rec.get("task") == task
         ]
 
+    @staticmethod
+    def _refused(target_id):
+        return (f"refused: tab {target_id} was not opened by the harness. Open your own with "
+                "new_tab(url); set BH_ALLOW_USER_TABS=1 only to act on the user's tabs deliberately")
+
     def _acts_on(self, req, method, params, sid):
         """(target_id, known) for the tab a request would act on; known=False when it cannot be told."""
         if method == "Target.closeTarget":
@@ -540,6 +545,7 @@ class Daemon:
             ))["sessionId"]
             self._record_session_replacement(replaces_session, self.session)
             self.target_id = tid
+            self._session_targets[self.session] = tid
             log(f"attached {tid} ({page.get('url','')[:80]}) session={self.session}")
             if enable_domains:
                 await self._enable_default_domains(self.session)
@@ -581,9 +587,11 @@ class Daemon:
         ))["sessionId"]
         self._record_session_replacement(replaces_session, self.session)
         self.target_id = pages[0]["targetId"]
-        # An empty page nobody is using (blank, new-tab page, the inspect tab we opened) is ours to drive.
-        if take_over or is_reusable_blank_page(pages[0]) or is_reusable_new_tab_page(pages[0]):
+        # Ours to drive: the inspect tab we opened, or any page of a cloud browser (exclusive to us).
+        # A pre-existing blank/new-tab page is still the user's.
+        if take_over or REMOTE_ID:
             self.own(self.target_id)
+        self._session_targets[self.session] = self.target_id
         log(f"attached {pages[0]['targetId']} ({pages[0].get('url','')[:80]}) session={self.session}")
         if take_over:
             try:
@@ -687,7 +695,7 @@ class Daemon:
 
     def _schedule_tab_marker(self, session_id):
         """Mark the controlled tab without extending the synchronous IPC path."""
-        if not tab_marker_enabled():
+        if not tab_marker_enabled() or self.target_id not in self.owned:
             return None
         return asyncio.create_task(_silent(asyncio.wait_for(
             self.cdp.send_raw(
@@ -853,13 +861,12 @@ class Daemon:
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         acts_on, known = self._acts_on(req, method, params, sid)
         if known and acts_on not in self.owned and not req.get("allow_user_tabs"):
-            return {"error": (
-                f"refused: tab {acts_on} was not opened by the harness. Open your own with "
-                "new_tab(url); set BH_ALLOW_USER_TABS=1 only to act on the user's tabs deliberately"
-            )}
+            return {"error": self._refused(acts_on)}
         try:
             result = await self.cdp.send_raw(method, params, session_id=sid)
-            if method == "Target.attachToTarget" and isinstance(result, dict) and result.get("sessionId"):
+            if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
+                self.own(result["targetId"], task=req.get("task"), url=params.get("url", ""))
+            elif method == "Target.attachToTarget" and isinstance(result, dict) and result.get("sessionId"):
                 self._session_targets[result["sessionId"]] = params.get("targetId")
                 while len(self._session_targets) > 64:
                     self._session_targets.pop(next(iter(self._session_targets)))
@@ -898,6 +905,9 @@ class Daemon:
                     # session. self.session may instead have changed because the
                     # user deliberately switched tabs while this request waited.
                     if replacement_session:
+                        landed_on = self._session_targets.get(replacement_session)
+                        if landed_on is not None and landed_on not in self.owned and not req.get("allow_user_tabs"):
+                            return {"error": self._refused(landed_on)}
                         try:
                             return {"result": await self.cdp.send_raw(
                                 method, params, session_id=replacement_session

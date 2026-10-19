@@ -56,8 +56,9 @@ class _IPCResponseTimeout(TimeoutError):
 
 
 def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
+    req = {**req, "task": TASK}  # tabs the daemon creates for this call are registered to the task
     if ALLOW_USER_TABS:
-        req = {**req, "allow_user_tabs": True}
+        req["allow_user_tabs"] = True
     c, token = ipc.connect(NAME, timeout=IPC_CONNECT_TIMEOUT_SECONDS)
     try:
         c.settimeout(response_timeout)
@@ -468,8 +469,7 @@ def new_tab(url="about:blank", reuse=True):
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
     # polls and wait_for_load() returns before navigation actually starts.
-    tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-    _send({"meta": "own_tab", "target_id": tid, "task": TASK})
+    tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]  # the daemon registers it to TASK
     switch_tab(tid)
     if url != "about:blank":
         goto_url(url)

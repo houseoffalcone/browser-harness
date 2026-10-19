@@ -114,6 +114,7 @@ def test_tab_marker_can_be_disabled_before_set_session_schedules_it(monkeypatch,
 def test_tab_marker_stays_enabled_by_default(monkeypatch):
     monkeypatch.delenv("BH_TAB_MARKER", raising=False)
     d = _fresh_daemon()
+    d.own("target-with-marker")  # the marker only lands on tabs the harness owns
 
     async def run():
         await d.handle({
