@@ -496,6 +496,15 @@ class Daemon:
         return (f"refused: tab {target_id} was not opened by the harness. Open your own with "
                 "new_tab(url); set BH_ALLOW_USER_TABS=1 only to act on the user's tabs deliberately")
 
+    async def _owning_page(self, tid):
+        """The page target a frame target belongs to (walk parentId); tid itself when it is a page or unknown."""
+        infos = {t["targetId"]: t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]}
+        seen = set()
+        while tid in infos and infos[tid].get("type") != "page" and infos[tid].get("parentId") and tid not in seen:
+            seen.add(tid)
+            tid = infos[tid]["parentId"]
+        return tid
+
     def _acts_on(self, req, method, params, sid):
         """(target_id, known) for the tab a request would act on; known=False when it cannot be told."""
         if method in ("Target.closeTarget", "Target.activateTarget"):
@@ -875,7 +884,8 @@ class Daemon:
             if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
                 self.own(result["targetId"], task=req.get("task"), url=params.get("url", ""))
             elif method == "Target.attachToTarget" and isinstance(result, dict) and result.get("sessionId"):
-                self._session_targets[result["sessionId"]] = params.get("targetId")
+                # An iframe target inside an owned tab is that tab's work (js(..., target_id=iframe_target(...))).
+                self._session_targets[result["sessionId"]] = await self._owning_page(params.get("targetId"))
                 while len(self._session_targets) > 64:
                     self._session_targets.pop(next(iter(self._session_targets)))
             elif method == "Target.closeTarget":
