@@ -1071,6 +1071,14 @@ class Daemon:
         if task_tid and not task_sid and not req.get("allow_user_tabs"):
             return {"error": f"refused: tab {task_tid} was closed; nothing was run. Open your own with new_tab(url)"}
         acts_on, known = (task_tid, True) if task_sid else self._acts_on(req, method, params, sid)
+        if (method.startswith("Target.") and isinstance(params.get("targetId"), str) and task
+                and not req.get("allow_user_tabs")):
+            # Any browser-level call naming a tab (getTargetInfo, close, activate, attach, ...): never
+            # one of another task's tabs (or an iframe inside one), not even to read its title or URL.
+            page = await self._owning_page(params["targetId"])
+            owner = self.owned.get(page, {}).get("task")
+            if owner is not None and owner not in (task, "daemon"):
+                return {"error": self._refused_task(page, owner, task)}
         if method == "Target.attachToTarget" and not req.get("allow_user_tabs"):
             # Attaching is already acting (it can enable Page/DOM/Runtime/Network on the tab): only a
             # tab of this task, or an iframe inside one.

@@ -798,3 +798,17 @@ def test_get_targets_hides_other_tasks_tabs_and_their_iframes():
     assert {"a-tab", "scratch", "user-tab"} <= set(seen)
     every = [t["targetId"] for t in _handle(d, {"method": "Target.getTargets", "params": {}})["result"]["targetInfos"]]
     assert "b-tab" in every  # no task (older helpers): unchanged
+
+
+# --- Codex round 10 (PR #3): no Target.* call reaches another task's tab ---
+
+def test_target_calls_naming_another_tasks_tab_are_refused():
+    d = _two_tasks()
+    d.cdp.targets.append({"targetId": "b-frame", "url": "https://b/f", "type": "iframe", "parentId": "b-tab"})
+    for method in ("Target.getTargetInfo", "Target.activateTarget", "Target.closeTarget", "Target.detachFromTarget"):
+        for tid in ("b-tab", "b-frame"):
+            r = _handle(d, {"method": method, "params": {"targetId": tid}, "task": "taskA"})
+            assert "refused" in r.get("error", "") and "taskB" in r["error"], (method, tid, r)
+    assert not any(m in ("Target.getTargetInfo", "Target.closeTarget") for m, _p, _s in d.cdp.calls)
+    assert "result" in _handle(d, {"method": "Target.getTargetInfo", "params": {"targetId": "a-tab"}, "task": "taskA"})
+    assert "result" in _handle(d, {"method": "Target.getTargetInfo", "params": {"targetId": "b-tab"}, "task": "taskB"})
