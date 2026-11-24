@@ -783,6 +783,19 @@ class Daemon:
         await self._enable_default_domains(sid)
         return sid
 
+    def _hide_other_tasks(self, infos, task):
+        """Target.getTargets as one task sees it: another task's tabs (and their iframes) are not listed."""
+        by_id = {t["targetId"]: t for t in infos}
+        def page_of(tid, seen=()):
+            t = by_id.get(tid)
+            if t and t.get("type") != "page" and t.get("parentId") and tid not in seen:
+                return page_of(t["parentId"], seen + (tid,))
+            return tid
+        def theirs(t):
+            owner = self.owned.get(page_of(t["targetId"]), {}).get("task")
+            return owner is not None and owner not in (task, "daemon")
+        return [t for t in infos if not theirs(t)]
+
     def _trim_session_targets(self, keep=256):
         """Bound the session→tab map without ever forgetting the daemon's current session
         (a forgotten session would be refused, so keep the live one)."""
@@ -1065,6 +1078,8 @@ class Daemon:
                 return {"error": refusal}
         try:
             result = await self.cdp.send_raw(method, params, session_id=sid)
+            if method == "Target.getTargets" and task and isinstance(result, dict) and not req.get("allow_user_tabs"):
+                result = {**result, "targetInfos": self._hide_other_tasks(result.get("targetInfos", []), task)}
             if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
                 self.own(result["targetId"], task=req.get("task"), url=params.get("url", ""))
             elif method == "Target.attachToTarget" and isinstance(result, dict) and result.get("sessionId"):

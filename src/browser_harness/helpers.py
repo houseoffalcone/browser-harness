@@ -383,11 +383,14 @@ def _is_agent_startup_placeholder(title, url):
 
 
 def list_tabs(include_chrome=True):
-    """Every page tab. `owned` marks the tabs the harness opened — the only ones it may act on."""
-    owned = {t["targetId"] for t in owned_tabs(None)}
+    """Every page tab except other tasks' tabs (their titles and URLs are theirs). `owned` marks this
+    task's tabs (and the daemon's scratch tab) — the only ones it may act on."""
+    every = owned_tabs(None)
+    owned = {t["targetId"] for t in every if t.get("task") in (TASK, "daemon")}
+    others = {t["targetId"] for t in every} - owned
     out = []
     for t in cdp("Target.getTargets")["targetInfos"]:
-        if t["type"] != "page": continue
+        if t["type"] != "page" or t["targetId"] in others: continue
         url = t.get("url", "")
         if _is_agent_startup_placeholder(t.get("title", ""), url): continue
         if not include_chrome and url.startswith(INTERNAL): continue

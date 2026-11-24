@@ -342,11 +342,14 @@ def test_ensure_real_tab_and_blank_reuse_never_take_another_tasks_tab(monkeypatc
 
 def test_list_tabs_marks_the_tabs_the_harness_owns(monkeypatch):
     calls = []
-    _fake_helpers(monkeypatch, [{"targetId": "mine", "url": "https://mine/", "task": "t", "urls": []}], calls)
+    _fake_helpers(monkeypatch, [{"targetId": "mine", "url": "https://mine/", "task": helpers.TASK, "urls": []},
+                                {"targetId": "theirs", "url": "https://mail/", "task": "other-task", "urls": []}], calls)
     monkeypatch.setattr(helpers, "cdp", lambda method, **kw: {"targetInfos": [
         {"targetId": "mine", "url": "https://mine/", "title": "", "type": "page"},
+        {"targetId": "theirs", "url": "https://mail/", "title": "Inbox", "type": "page"},
         {"targetId": "user", "url": "https://user/", "title": "", "type": "page"},
     ]})
+    # another task's tab is not listed at all; the user's is listed, not owned
     assert [(t["targetId"], t["owned"]) for t in helpers.list_tabs()] == [("mine", True), ("user", False)]
 
 
@@ -768,3 +771,16 @@ def test_default_task_is_per_agent_session():
     assert helpers._default_task({"ORCA_TERMINAL_HANDLE": "term_9"}) == "orca:term_9"
     assert helpers._default_task({"CODEX_THREAD_ID": "t1"}) == "codex:t1"
     assert helpers._default_task({}) == "default"
+
+
+# --- Codex round 8 (PR #3): a task does not even see another task's tabs ---
+
+def test_get_targets_hides_other_tasks_tabs_and_their_iframes():
+    d = _two_tasks()
+    d.cdp.targets.append({"targetId": "b-frame", "url": "https://b/f", "type": "iframe", "parentId": "b-tab"})
+    d.cdp.targets.append({"targetId": "user-tab", "url": "https://user/", "type": "page"})
+    seen = [t["targetId"] for t in _handle(d, {"method": "Target.getTargets", "params": {}, "task": "taskA"})["result"]["targetInfos"]]
+    assert "b-tab" not in seen and "b-frame" not in seen
+    assert {"a-tab", "scratch", "user-tab"} <= set(seen)
+    every = [t["targetId"] for t in _handle(d, {"method": "Target.getTargets", "params": {}})["result"]["targetInfos"]]
+    assert "b-tab" in every  # no task (older helpers): unchanged

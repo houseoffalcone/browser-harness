@@ -44,11 +44,7 @@ PY
   only on its own tabs: another task's tab is refused, and when your tab is closed
   mid-task the next call is refused ("was closed; nothing was run") — open a new
   one with `new_tab(url)`; nothing is ever re-run on a different tab.
-  Without `BH_TASK` the task is your agent session (Claude Code session, else the
-  Orca terminal), so two agents sharing one daemon never share tabs. A task acts
-  only on its own tabs: another task's tab is refused, and when your tab is closed
-  mid-task the next call is refused ("was closed; nothing was run") — open a new
-  one with `new_tab(url)`; nothing is ever re-run on a different tab.
+  `list_tabs()` leaves out other tasks' tabs.
 - At task completion call `close_task_tabs()`. It closes the tabs this task
   opened — only those — and only when each still sits on a site the harness sent
   it to; a tab that was navigated elsewhere (a login redirect, the user browsing
