@@ -460,6 +460,8 @@ class Daemon:
         self._task_target = {}          # task -> the tab it last switched to (each task has its own current tab)
         self._target_session = {}       # tab -> the session the daemon holds on it
         self._task_locks = {}           # task -> lock, so one task never attaches its tab twice at once
+        self._task_closed = {}          # task -> its last tab, closed (its next request is refused, not redirected)
+        self._dialogs = {}              # session -> the JS dialog open on it
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
@@ -471,6 +473,7 @@ class Daemon:
         rec = self.owned.setdefault(target_id, {"task": task or "daemon", "urls": [], "opened": time.time()})
         if task:
             rec["task"] = task
+            self._task_closed.pop(task, None)  # the task has a tab again
             if task != "daemon" and target_id == self.dedicated_target_id:
                 # The scratch tab is a task's now: shutdown must not close that task's work.
                 self.dedicated_target_id = None
@@ -479,10 +482,17 @@ class Daemon:
         _save_owned(self.owned)
 
     def disown(self, target_id):
-        self._target_session.pop(target_id, None)
+        """Forget a tab (closed, or closed by the harness). A task whose last tab this was keeps a note of
+        it, so its next request is refused ("was closed") instead of running on the scratch tab."""
+        self._dialogs.pop(self._target_session.pop(target_id, None), None)
         for t in [t for t, tid in self._task_target.items() if tid == target_id]:
             self._task_target.pop(t, None)
-        if self.owned.pop(target_id, None) is not None:
+        rec = self.owned.pop(target_id, None)
+        if rec is not None:
+            task = rec.get("task")
+            if task and task != "daemon" and not any(r.get("task") == task for r in self.owned.values()):
+                self._task_closed[task] = target_id
+                self._task_locks.pop(task, None)
             _save_owned(self.owned)
 
     async def owned_live(self, task=None):
@@ -492,9 +502,7 @@ class Daemon:
         live = {t["targetId"]: t for t in targets if t["type"] == "page"}
         gone = [tid for tid in self.owned if tid not in live]
         for tid in gone:
-            self.owned.pop(tid)
-        if gone:
-            _save_owned(self.owned)
+            self.disown(tid)
         return [
             {"targetId": tid, "url": live[tid].get("url", ""), "title": live[tid].get("title", ""), **rec}
             for tid, rec in self.owned.items() if task is None or rec.get("task") == task
@@ -516,6 +524,8 @@ class Daemon:
         Requests without a task (older helpers) keep the daemon-wide rule."""
         rec = self.owned.get(target_id)
         if rec is None:
+            if target_id is not None and target_id in self._task_closed.values():
+                return f"refused: tab {target_id} was closed; nothing was run. Open your own with new_tab(url)"
             return self._refused(target_id)
         owner = rec.get("task") or "daemon"
         if task and owner not in (task, "daemon"):
@@ -705,7 +715,8 @@ class Daemon:
         newest live tab (after a daemon restart). Never changes the daemon's global session, so
         concurrent tasks and recoveries cannot pull each other's requests onto the wrong tab."""
         if not task or not any(r.get("task") == task for r in self.owned.values()):
-            return None, None
+            closed = self._task_closed.get(task) if task else None
+            return (None, closed) if closed else (None, None)
         lock = self._task_locks.setdefault(task, asyncio.Lock())
         async with lock:
             tid = self._task_target.get(task)
@@ -833,8 +844,10 @@ class Daemon:
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
+            self._dialogs[session_id] = params
         elif method == "Page.javascriptDialogClosed":
             self.dialog = None
+            self._dialogs.pop(session_id, None)
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
             self._schedule_tab_marker(self.session)
 
@@ -882,7 +895,14 @@ class Daemon:
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
         if meta == "drain_events":
-            out = list(self.events); self.events.clear()
+            view_sid, _vt = await self._view(req) if req.get("task") else (None, None)
+            if view_sid is None or view_sid == self.session and not self._task_target:
+                out = list(self.events); self.events.clear()
+                return {"events": out}
+            # Tasks share one buffer: take only this task's session's events, leave the rest for theirs.
+            out = [e for e in self.events if e.get("session_id") == view_sid]
+            keep = [e for e in self.events if e.get("session_id") != view_sid]
+            self.events.clear(); self.events.extend(keep)
             return {"events": out}
         if meta == "session":     return {"session_id": (await self._view(req))[0]}
         if meta == "current_tab":
@@ -941,7 +961,8 @@ class Daemon:
             # even on a remote daemon — sequentially these would have stacked
             # to ~22s worst case.
             tasks = []
-            if old_session and old_session != new_session:
+            in_use = {self._target_session.get(t) for k, t in self._task_target.items() if k != req.get("task")}
+            if old_session and old_session != new_session and old_session not in in_use:
                 async def disable_old():
                     try:
                         await asyncio.wait_for(
@@ -956,7 +977,9 @@ class Daemon:
             # it doesn't add to the synchronous IPC budget.
             self._schedule_tab_marker(new_session)
             return {"session_id": new_session}
-        if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "pending_dialog":
+            view_sid, _vt = await self._view(req)
+            return {"dialog": self._dialogs.get(view_sid) if req.get("task") else self.dialog}
         if meta == "own_tab":
             # Claim only a tab already this task's or the daemon's scratch tab: never a user's tab, and
             # never another task's (two tasks racing for the scratch tab: the second is refused).
@@ -1009,6 +1032,8 @@ class Daemon:
         if not method.startswith("Target.") and not req.get("session_id"):
             task_sid, task_tid = await self._task_tab(task)
         sid = None if method.startswith("Target.") else (req.get("session_id") or task_sid or self.session)
+        if task_tid and not task_sid and not req.get("allow_user_tabs"):
+            return {"error": f"refused: tab {task_tid} was closed; nothing was run. Open your own with new_tab(url)"}
         acts_on, known = (task_tid, True) if task_sid else self._acts_on(req, method, params, sid)
         if method == "Target.attachToTarget" and not req.get("allow_user_tabs"):
             # Attaching is already acting (it can enable Page/DOM/Runtime/Network on the tab): only a

@@ -661,3 +661,39 @@ def test_owned_tabs_none_is_sent_as_none(monkeypatch):
 class _Conn:
     def settimeout(self, t): pass
     def close(self): pass
+
+
+# --- Codex round 4 (PR #3): nothing shared between tasks leaks or misleads ---
+
+def test_a_task_whose_tab_was_pruned_is_refused_not_redirected_to_scratch():
+    d = _two_tasks()
+    d.cdp.targets[:] = [t for t in d.cdp.targets if t["targetId"] != "b-tab"]  # B's tab closed outside
+    _handle(d, {"meta": "owned_tabs", "task": None})  # the listing prunes it
+    assert "b-tab" not in d.owned and "taskB" not in d._task_locks
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})
+    assert "closed" in r["error"]
+    assert not any(m == "Runtime.evaluate" for m, _p, _s in d.cdp.calls)
+    d.own("b-new", task="taskB")  # a new tab of its own lifts it
+    assert "taskB" not in d._task_closed
+
+
+def test_events_and_dialogs_stay_with_their_task():
+    d = _two_tasks()
+    asyncio.run(d._task_tab("taskA")); asyncio.run(d._task_tab("taskB"))
+    d._record_event("Network.requestWillBeSent", {"requestId": "a1"}, "session-for-a-tab")
+    d._record_event("Network.requestWillBeSent", {"requestId": "b1"}, "session-for-b-tab")
+    d._record_event("Page.javascriptDialogOpening", {"message": "B's secret"}, "session-for-b-tab")
+    got_a = _handle(d, {"meta": "drain_events", "task": "taskA"})["events"]
+    assert [e["params"].get("requestId") for e in got_a] == ["a1"]
+    assert len(d.events) == 2  # B's events are still there for B
+    assert _handle(d, {"meta": "pending_dialog", "task": "taskA"})["dialog"] is None
+    assert _handle(d, {"meta": "pending_dialog", "task": "taskB"})["dialog"] == {"message": "B's secret"}
+
+
+def test_switching_tabs_never_disables_network_on_another_tasks_session():
+    d = _two_tasks()
+    asyncio.run(d._task_tab("taskA"))
+    d.session, d.target_id = "session-for-a-tab", "a-tab"; d._task_target["taskA"] = "a-tab"
+    d._session_targets["sess-b2"] = "b-tab"
+    _handle(d, {"meta": "set_session", "session_id": "sess-b2", "task": "taskB"})
+    assert ("Network.disable", None, "session-for-a-tab") not in d.cdp.calls
