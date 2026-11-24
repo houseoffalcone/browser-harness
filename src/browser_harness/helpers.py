@@ -409,8 +409,11 @@ def _my_tabs():
 
 def owned_tabs(task=TASK):
     """Tabs the harness opened that are still open, with their current url/title and the urls the
-    harness sent them to. Defaults to this task (BH_TASK); task=None lists every task's tabs."""
-    return _send({"meta": "owned_tabs", "task": task}).get("tabs", [])
+    harness sent them to. Defaults to this task (BH_TASK); task=None lists every task's tabs, another
+    task's only as {targetId, task} (never its title or URL)."""
+    if task is None:
+        return _send({"meta": "owned_tabs", "task": TASK, "all": True}).get("tabs", [])
+    return _send({"meta": "owned_tabs", "task": TASK, "of": task}).get("tabs", [])
 
 def _host(url):
     return (urlparse(url).hostname or "").removeprefix("www.")

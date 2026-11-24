@@ -1024,7 +1024,14 @@ class Daemon:
             return {"ok": True}
         if meta == "owned_tabs":
             try:
-                return {"tabs": await self.owned_live(req.get("task"))}
+                asker = req.get("task")
+                of = None if req.get("all") else req.get("of", asker)
+                tabs = await self.owned_live(of)
+                if not asker:  # older helpers: as before
+                    return {"tabs": tabs}
+                # Every task's tabs, but another task's only as an id and owner: never its title or URL.
+                return {"tabs": [t if t.get("task") in (asker, "daemon") else {"targetId": t["targetId"], "task": t.get("task")}
+                                 for t in tabs]}
             except Exception:
                 return {"error": "cdp_disconnected"}
         if meta == "shutdown":

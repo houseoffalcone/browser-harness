@@ -659,7 +659,21 @@ def test_owned_tabs_none_is_sent_as_none(monkeypatch):
     monkeypatch.setattr(helpers.ipc, "request", lambda c, token, req: sent.append(req) or {"tabs": []})
     helpers.owned_tabs(None)
     helpers.owned_tabs()
-    assert sent[0]["task"] is None and sent[1]["task"] == helpers.TASK
+    helpers.owned_tabs("other")
+    assert [(r["task"], r.get("all"), r.get("of")) for r in sent] == [
+        (helpers.TASK, True, None), (helpers.TASK, None, helpers.TASK), (helpers.TASK, None, "other")]
+
+
+def test_owned_tabs_never_hands_another_tasks_title_or_url():
+    d = _two_tasks()
+    every = _handle(d, {"meta": "owned_tabs", "task": "taskA", "all": True})["tabs"]
+    b = next(t for t in every if t["targetId"] == "b-tab")
+    assert b == {"targetId": "b-tab", "task": "taskB"}
+    a = next(t for t in every if t["targetId"] == "a-tab")
+    assert a["url"] == "https://a/"
+    asked_for_b = _handle(d, {"meta": "owned_tabs", "task": "taskA", "of": "taskB"})["tabs"]
+    assert asked_for_b == [{"targetId": "b-tab", "task": "taskB"}]
+    assert _handle(d, {"meta": "owned_tabs", "task": "taskB"})["tabs"][0]["url"] == "https://b/"
 
 
 class _Conn:
