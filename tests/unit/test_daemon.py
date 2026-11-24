@@ -93,6 +93,13 @@ def _fresh_daemon():
     return d
 
 
+def _attached(d, session_id, target_id):
+    """What helpers.switch_tab() does before set_session: the harness's own tab, attached through
+    the daemon (which records session → tab). set_session refuses any other session."""
+    d.own(target_id)
+    d._session_targets[session_id] = target_id
+
+
 @pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
 def test_tab_marker_can_be_disabled_before_set_session_schedules_it(monkeypatch, value):
     monkeypatch.setenv("BH_TAB_MARKER", value)
@@ -117,6 +124,7 @@ def test_tab_marker_stays_enabled_by_default(monkeypatch):
     d.own("target-with-marker")  # the marker only lands on tabs the harness owns
 
     async def run():
+        _attached(d, "session-with-marker", "target-with-marker")
         await d.handle({
             "meta": "set_session",
             "session_id": "session-with-marker",
@@ -155,6 +163,7 @@ def test_set_session_enables_all_four_default_domains_on_new_session():
     d = _fresh_daemon()
     new_session = "session-AFTER-switch"
 
+    _attached(d, new_session, "target-2")
     asyncio.run(d.handle({
         "meta": "set_session",
         "session_id": new_session,
@@ -180,6 +189,7 @@ def test_set_session_falls_back_to_existing_target_id_when_not_provided():
     d = _fresh_daemon()
     d.target_id = "original-target"
 
+    _attached(d, "session-AFTER", "original-target")
     asyncio.run(d.handle({
         "meta": "set_session",
         "session_id": "session-AFTER",
@@ -222,6 +232,7 @@ def test_set_session_disables_network_on_old_session_before_enabling_new():
     d.session = "session-OLD"
     d.target_id = "target-OLD"
 
+    _attached(d, "session-NEW", "target-NEW")
     asyncio.run(d.handle({
         "meta": "set_session",
         "session_id": "session-NEW",
@@ -294,6 +305,7 @@ def test_set_session_runs_disable_and_enables_in_parallel():
         d.session = "session-OLD"  # ensures Network.disable on old fires
         d.cdp.release = asyncio.Event()
 
+        _attached(d, "session-NEW", "target-NEW")
         handle_task = asyncio.create_task(d.handle({
             "meta": "set_session",
             "session_id": "session-NEW",
@@ -349,6 +361,7 @@ def test_set_session_first_attach_runs_four_enables_in_parallel():
         d.session = None  # no previous session
         d.cdp.release = asyncio.Event()
 
+        _attached(d, "session-FIRST", "target-FIRST")
         handle_task = asyncio.create_task(d.handle({
             "meta": "set_session",
             "session_id": "session-FIRST",
@@ -800,6 +813,7 @@ def test_tab_switch_waits_for_recovery_and_keeps_old_action_on_old_tab(monkeypat
             "params": {"expression": "old-tab-action"},
         }))
         await d.cdp.discovery_started.wait()
+        _attached(d, "new-session", "new-tab")
         switch = asyncio.create_task(d.handle({
             "meta": "set_session",
             "session_id": "new-session",

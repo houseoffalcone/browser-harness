@@ -127,9 +127,10 @@ def test_owned_tabs_meta_returns_live_tabs_per_task_and_prunes_closed_ones():
 
 def test_own_tab_meta_retags_the_task_and_disown_forgets():
     d = _daemon()
+    d.own("t")  # the daemon's scratch tab
     _handle(d, {"meta": "own_tab", "target_id": "t", "task": "a"})
-    _handle(d, {"meta": "own_tab", "target_id": "t", "task": "b"})
-    assert d.owned["t"]["task"] == "b"
+    _handle(d, {"meta": "own_tab", "target_id": "t", "task": "a", "url": "https://a/"})
+    assert d.owned["t"]["task"] == "a" and d.owned["t"]["urls"] == ["https://a/"]
     _handle(d, {"meta": "disown_tab", "target_id": "t"})
     assert d.owned == {}
 
@@ -461,12 +462,12 @@ def test_navigating_the_scratch_tab_makes_it_the_tasks(monkeypatch):
 
 
 def test_set_session_takes_the_tab_from_the_session_it_names(monkeypatch):
-    d = _daemon(current="mine")
+    d = _daemon(targets=[{"targetId": "mine2", "url": "https://m/", "type": "page"}], current="mine")
     d.own("mine")
-    _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "user-tab", "flatten": True}})
-    _handle(d, {"meta": "set_session", "session_id": "session-for-user-tab"})  # no target_id given
-    assert d.target_id == "user-tab"
-    assert "refused" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}})["error"]
+    d.own("mine2")
+    _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "mine2", "flatten": True}})
+    _handle(d, {"meta": "set_session", "session_id": "session-for-mine2", "target_id": "mine"})  # a wrong target_id
+    assert d.target_id == "mine2"  # the session decides, not the caller's word
 
 
 def test_session_map_trim_keeps_the_current_session():
@@ -477,3 +478,62 @@ def test_session_map_trim_keeps_the_current_session():
         d._session_targets[f"s{i}"] = "mine"
     d._trim_session_targets()
     assert len(d._session_targets) == 256 and d._session_targets["live"] == "mine"
+
+
+# --- Codex round 1 (PR #3) ---
+
+def test_claiming_the_scratch_tab_stops_shutdown_from_closing_it():
+    d = _daemon(current="scratch")
+    d.own("scratch"); d.dedicated_target_id = "scratch"
+    assert _handle(d, {"meta": "own_tab", "target_id": "scratch", "task": "taskA"}) == {"ok": True}
+    assert d.dedicated_target_id is None and d.owned["scratch"]["task"] == "taskA"
+
+
+def test_attach_and_set_session_on_a_tab_not_this_tasks_are_refused():
+    d = _daemon(targets=[{"targetId": "user-tab", "url": "https://user/", "type": "page"},
+                         {"targetId": "a-tab", "url": "https://a/", "type": "page"},
+                         {"targetId": "a-frame", "url": "https://a/f", "type": "iframe", "parentId": "a-tab"}],
+                current="a-tab")
+    d.own("a-tab", task="taskA")
+    r = _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "user-tab", "flatten": True}, "task": "taskA"})
+    assert "refused" in r["error"]
+    r = _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "a-tab", "flatten": True}, "task": "taskB"})
+    assert "refused" in r["error"]
+    assert not any(m == "Target.attachToTarget" for m, _p, _s in d.cdp.calls)
+    assert "result" in _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "a-frame", "flatten": True}, "task": "taskA"})
+    assert "refused" in _handle(d, {"meta": "set_session", "session_id": "made-up", "task": "taskA"})["error"]
+    d._session_targets["sess-a"] = "a-tab"
+    assert "refused" in _handle(d, {"meta": "set_session", "session_id": "sess-a", "task": "taskB"})["error"]
+    assert d.session == "session-current"
+    assert "error" not in _handle(d, {"meta": "set_session", "session_id": "sess-a", "task": "taskA"})
+    assert d.session == "sess-a" and d.target_id == "a-tab"
+
+
+def test_second_task_cannot_retag_the_first_tasks_tab():
+    d = _daemon()
+    d.own("scratch")
+    assert _handle(d, {"meta": "own_tab", "target_id": "scratch", "task": "taskA"}) == {"ok": True}
+    r = _handle(d, {"meta": "own_tab", "target_id": "scratch", "task": "taskB"})
+    assert "refused" in r["error"] and d.owned["scratch"]["task"] == "taskA"
+    assert "refused" in _handle(d, {"meta": "own_tab", "target_id": "user-tab", "task": "taskA"})["error"]
+
+
+def test_new_tab_opens_its_own_when_the_scratch_claim_is_refused(monkeypatch):
+    calls = []
+    _fake_helpers(monkeypatch, [{"targetId": "scratch", "url": "about:blank", "task": "daemon", "urls": []}], calls)
+    def refuse(request):
+        calls.append(("ipc", request))
+        raise RuntimeError("refused: tab scratch belongs to task 'taskA'")
+    monkeypatch.setattr(helpers, "_send", refuse)
+    assert helpers.new_tab("https://example.com/") == "created"
+    assert ("switch_tab", "created") in calls and ("switch_tab", "scratch") not in calls
+
+
+def test_restart_reuses_the_left_scratch_tab_and_still_closes_it(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "default")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+    d = _daemon(targets=[{"targetId": "left", "url": "about:blank", "type": "page"}])
+    d.own("left")
+    asyncio.run(d.attach_first_page())
+    assert d.target_id == "left" and d.dedicated_target_id == "left" and d.cdp.created == 0

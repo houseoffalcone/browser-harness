@@ -468,6 +468,9 @@ class Daemon:
         rec = self.owned.setdefault(target_id, {"task": task or "daemon", "urls": [], "opened": time.time()})
         if task:
             rec["task"] = task
+            if task != "daemon" and target_id == self.dedicated_target_id:
+                # The scratch tab is a task's now: shutdown must not close that task's work.
+                self.dedicated_target_id = None
         if url and url not in rec["urls"]:
             rec["urls"].append(url)
         _save_owned(self.owned)
@@ -594,6 +597,8 @@ class Daemon:
             pages = [t for t in targets
                      if t["targetId"] in self.owned and self.owned[t["targetId"]].get("task") == "daemon"
                      and t["type"] == "page"]
+            if pages and not REMOTE_ID:
+                self.dedicated_target_id = pages[0]["targetId"]  # left by an earlier run: still closed at shutdown
         if not pages and REMOTE_ID:
             # A cloud browser is exclusive to this daemon, so its pages are ours to take.
             pages = [t for t in targets if is_real_page(t)]
@@ -840,6 +845,13 @@ class Daemon:
                 }
             return {"target_id": self.target_id, "session_id": self.session, "page": page}
         if meta == "set_session":
+            tid = self._session_targets.get(req.get("session_id"))
+            if not req.get("allow_user_tabs"):
+                if tid is None:
+                    return {"error": f"refused: session {req.get('session_id')} is not one the harness attached"}
+                refusal = self._may_act(tid, req.get("task"))
+                if refusal:
+                    return {"error": refusal}
             async with self._session_state_lock:
                 old_session = self.session
                 self.session = req.get("session_id")
@@ -872,7 +884,14 @@ class Daemon:
             return {"session_id": new_session}
         if meta == "pending_dialog": return {"dialog": self.dialog}
         if meta == "own_tab":
-            self.own(req.get("target_id"), task=req.get("task"), url=req.get("url", ""))
+            # Claim only a tab already this task's or the daemon's scratch tab: never a user's tab, and
+            # never another task's (two tasks racing for the scratch tab: the second is refused).
+            tid = req.get("target_id")
+            if not req.get("allow_user_tabs"):
+                refusal = self._may_act(tid, req.get("task"))
+                if refusal:
+                    return {"error": refusal}
+            self.own(tid, task=req.get("task"), url=req.get("url", ""))
             return {"ok": True}
         if meta == "disown_tab":
             self.disown(req.get("target_id"))
@@ -912,6 +931,12 @@ class Daemon:
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         acts_on, known = self._acts_on(req, method, params, sid)
         task = req.get("task")
+        if method == "Target.attachToTarget" and not req.get("allow_user_tabs"):
+            # Attaching is already acting (it can enable Page/DOM/Runtime/Network on the tab): only a
+            # tab of this task, or an iframe inside one.
+            refusal = self._may_act(await self._owning_page(params.get("targetId")), task)
+            if refusal:
+                return {"error": refusal}
         if known and not req.get("allow_user_tabs"):
             if acts_on is None:
                 return {"error": f"refused: session {sid} is not one the harness attached; use switch_tab() or new_tab()"}

@@ -465,7 +465,11 @@ def new_tab(url="about:blank", reuse=True):
         blank = [t for t in _my_tabs() if _is_blankish(t["url"])]
         pick = (same_site or blank or [None])[-1]
         if pick:
-            _send({"meta": "own_tab", "target_id": pick["targetId"], "task": TASK})
+            try:
+                _send({"meta": "own_tab", "target_id": pick["targetId"], "task": TASK})
+            except RuntimeError:
+                pick = None  # another task claimed it first: open our own below
+        if pick:
             switch_tab(pick["targetId"])
             if url != "about:blank":
                 goto_url(url)
