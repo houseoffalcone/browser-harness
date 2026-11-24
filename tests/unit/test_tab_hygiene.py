@@ -549,7 +549,7 @@ def test_after_another_tasks_recovery_a_task_is_put_back_on_its_own_tab(monkeypa
     assert "closed" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})["error"]
     assert d.target_id != "a-tab"  # B's recovery parked on the scratch tab
     r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "document.title"}, "task": "taskA"})
-    assert "result" in r and d.target_id == "a-tab"
+    assert "result" in r  # ran on A's own tab, through A's own session; the global one is untouched
     assert ("Runtime.evaluate", {"expression": "document.title"}, "session-for-a-tab") in d.cdp.calls
 
 
@@ -562,7 +562,8 @@ def test_after_a_restart_a_task_continues_on_its_newest_live_tab():
     d.own("new", task="taskA"); d.owned["new"]["opened"] = 2
     d.own("gone", task="taskA"); d.owned["gone"]["opened"] = 3  # closed while the daemon was down
     r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskA"})
-    assert "result" in r and d.target_id == "new"
+    assert "result" in r and ("Runtime.evaluate", {"expression": "1"}, "session-for-new") in d.cdp.calls
+    assert asyncio.run(d._task_tab("taskA")) == ("session-for-new", "new")
 
 
 def test_a_task_with_no_tab_stays_on_the_scratch_tab_without_extra_calls():
@@ -581,3 +582,82 @@ def test_cloud_recovery_never_takes_another_tasks_page(monkeypatch):
     d.own("a-tab", task="taskA")
     asyncio.run(d.attach_first_page())
     assert d.target_id == "free"
+
+
+
+# --- Codex round 3 (PR #3): concurrent tasks and status requests ---
+
+class _YieldingCDP(_CDP):
+    """Yields on every call, so concurrent handlers really interleave."""
+    async def send_raw(self, method, params=None, session_id=None):
+        await asyncio.sleep(0)
+        if method == "Target.getTargetInfo":
+            t = next(t for t in self.targets if t["targetId"] == params["targetId"])
+            return {"targetInfo": {**t, "title": t["targetId"]}}
+        return await super().send_raw(method, params, session_id)
+
+
+def _two_tasks():
+    d = _daemon(targets=[{"targetId": "a-tab", "url": "https://a/", "type": "page"},
+                         {"targetId": "b-tab", "url": "https://b/", "type": "page"},
+                         {"targetId": "scratch", "url": "about:blank", "type": "page"}], current="scratch")
+    d.cdp = _YieldingCDP(d.cdp.targets)
+    d.own("scratch"); d.own("a-tab", task="taskA"); d.own("b-tab", task="taskB")
+    return d
+
+
+def test_concurrent_tasks_each_run_on_their_own_tab():
+    d = _two_tasks()
+    async def run():
+        return await asyncio.gather(*[d.handle({"method": "Runtime.evaluate", "params": {"expression": t},
+                                                "task": t}) for t in ("taskA", "taskB", "taskA", "taskB")])
+    out = asyncio.run(run())
+    assert all("result" in r for r in out), out
+    ran = [(p["expression"], s) for m, p, s in d.cdp.calls if m == "Runtime.evaluate"]
+    assert sorted(set(ran)) == [("taskA", "session-for-a-tab"), ("taskB", "session-for-b-tab")]
+    assert d.session == "session-current" and d.target_id == "scratch"  # the global session never moved
+    assert sum(1 for m, p, _s in d.cdp.calls if m == "Target.attachToTarget") == 2  # one attach per task
+
+
+def test_status_requests_answer_for_the_asking_task():
+    d = _two_tasks()
+    assert _handle(d, {"meta": "current_tab", "task": "taskA"})["targetId"] == "a-tab"
+    assert _handle(d, {"meta": "current_tab", "task": "taskB"})["targetId"] == "b-tab"
+    assert _handle(d, {"meta": "session", "task": "taskB"})["session_id"] == "session-for-b-tab"
+    assert _handle(d, {"meta": "connection_status", "task": "taskA"})["target_id"] == "a-tab"
+    assert _handle(d, {"meta": "current_tab", "task": "nobody"})["targetId"] == "scratch"
+
+
+def test_a_stale_task_session_recovers_on_its_own_tab_while_another_task_works():
+    d = _two_tasks()
+    d._target_session["b-tab"] = "b-stale"; d._session_targets["b-stale"] = "b-tab"; d._task_target["taskB"] = "b-tab"
+
+    class _StaleB(_YieldingCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            if session_id == "b-stale":
+                self.calls.append((method, params, session_id))
+                raise RuntimeError("Session with given id not found")
+            return await super().send_raw(method, params, session_id)
+    d.cdp = _StaleB(d.cdp.targets)
+    async def run():
+        return await asyncio.gather(
+            d.handle({"method": "Runtime.evaluate", "params": {"expression": "b"}, "task": "taskB"}),
+            d.handle({"method": "Runtime.evaluate", "params": {"expression": "a"}, "task": "taskA"}))
+    rb, ra = asyncio.run(run())
+    assert "result" in rb and "result" in ra
+    assert ("Runtime.evaluate", {"expression": "b"}, "session-for-b-tab") in d.cdp.calls  # replayed on B's own tab
+    assert ("Runtime.evaluate", {"expression": "a"}, "session-for-a-tab") in d.cdp.calls
+
+
+def test_owned_tabs_none_is_sent_as_none(monkeypatch):
+    sent = []
+    monkeypatch.setattr(helpers.ipc, "connect", lambda name, timeout: (_Conn(), "tok"))
+    monkeypatch.setattr(helpers.ipc, "request", lambda c, token, req: sent.append(req) or {"tabs": []})
+    helpers.owned_tabs(None)
+    helpers.owned_tabs()
+    assert sent[0]["task"] is None and sent[1]["task"] == helpers.TASK
+
+
+class _Conn:
+    def settimeout(self, t): pass
+    def close(self): pass

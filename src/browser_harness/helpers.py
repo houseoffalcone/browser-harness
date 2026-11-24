@@ -56,7 +56,7 @@ class _IPCResponseTimeout(TimeoutError):
 
 
 def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
-    req = {**req, "task": TASK}  # tabs the daemon creates for this call are registered to the task
+    req = {"task": TASK, **req}  # tabs the daemon creates are registered to the task; an explicit task (even None) wins
     if ALLOW_USER_TABS:
         req["allow_user_tabs"] = True
     c, token = ipc.connect(NAME, timeout=IPC_CONNECT_TIMEOUT_SECONDS)
