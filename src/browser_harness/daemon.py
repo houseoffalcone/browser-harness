@@ -496,6 +496,23 @@ class Daemon:
         return (f"refused: tab {target_id} was not opened by the harness. Open your own with "
                 "new_tab(url); set BH_ALLOW_USER_TABS=1 only to act on the user's tabs deliberately")
 
+    @staticmethod
+    def _refused_task(target_id, owner, task):
+        return (f"refused: tab {target_id} belongs to task {owner!r}, not {task!r}. Open your own with "
+                "new_tab(url); tasks sharing one daemon never act on each other's tabs")
+
+    def _may_act(self, target_id, task):
+        """None when this request may act on target_id, else the refusal. A tab is the task's that
+        opened it; a tab still tagged "daemon" (the daemon's own scratch tab) is any task's.
+        Requests without a task (older helpers) keep the daemon-wide rule."""
+        rec = self.owned.get(target_id)
+        if rec is None:
+            return self._refused(target_id)
+        owner = rec.get("task") or "daemon"
+        if task and owner not in (task, "daemon"):
+            return self._refused_task(target_id, owner, task)
+        return None
+
     async def _owning_page(self, tid):
         """The page target a frame target belongs to (walk parentId); tid itself when it is a page or unknown."""
         infos = {t["targetId"]: t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]}
@@ -512,8 +529,8 @@ class Daemon:
         if method.startswith("Target."):
             return None, False  # browser-level
         if req.get("session_id"):
-            tid = self._session_targets.get(sid)
-            return tid, tid is not None
+            # A session the daemon never saw attached (or forgot) cannot be told: refused below, never passed.
+            return self._session_targets.get(sid), True
         return self.target_id, self.target_id is not None
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
@@ -573,16 +590,21 @@ class Daemon:
         pages_by_id = {t["targetId"]: t for t in targets if t["type"] == "page"}
         pages = [pages_by_id[self.target_id]] if self.target_id in pages_by_id else []
         if not pages:
-            pages = [t for t in targets if t["targetId"] in self.owned and is_real_page(t)]
-        if not pages:
+            # Only the daemon's own scratch tab: a task's tab is that task's, never a fallback for another.
+            pages = [t for t in targets
+                     if t["targetId"] in self.owned and self.owned[t["targetId"]].get("task") == "daemon"
+                     and t["type"] == "page"]
+        if not pages and REMOTE_ID:
+            # A cloud browser is exclusive to this daemon, so its pages are ours to take.
             pages = [t for t in targets if is_real_page(t)]
-        if not pages:
-            # Fresh browser (ex: BU cloud) starts w about:blank; reuse it
-            pages = [t for t in targets if is_reusable_blank_page(t)]
-        if not pages:
-            # Freshly launched browser (ex: harness relaunching closed Chrome)
-            # starts with just the New Tab Page. Reuse it — creating about:blank
-            pages = [t for t in targets if is_reusable_new_tab_page(t)]
+            if not pages:
+                # Fresh browser (ex: BU cloud) starts w about:blank; reuse it
+                pages = [t for t in targets if is_reusable_blank_page(t)]
+            if not pages:
+                # Freshly launched browser starts with just the New Tab Page. Reuse it.
+                pages = [t for t in targets if is_reusable_new_tab_page(t)]
+        # A local Chrome is the user's (or other daemons'): never attach to a tab the harness did not
+        # open, not even to look — attaching streams that tab's network events into this daemon.
         take_over = None
         if not pages and harness_opened_inspect():
             # After perms granted, only tab is often chrome://inspect
@@ -596,9 +618,11 @@ class Daemon:
             tid = (await self.cdp.send_raw(
                 "Target.createTarget", {"url": "about:blank", "background": True}
             ))["targetId"]
-            log(f"no real pages found, created about:blank ({tid})")
+            log(f"no tab of the harness's own, created about:blank ({tid})")
             pages = [{"targetId": tid, "url": "about:blank", "type": "page"}]
             self.own(tid)
+            if not REMOTE_ID:
+                self.dedicated_target_id = tid  # the daemon's scratch tab: closed again at shutdown
         self.session = (await self.cdp.send_raw(
             "Target.attachToTarget", {"targetId": pages[0]["targetId"], "flatten": True}
         ))["sessionId"]
@@ -661,6 +685,15 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+
+    def _trim_session_targets(self, keep=256):
+        """Bound the session→tab map without ever forgetting the daemon's current session
+        (a forgotten session would be refused, so keep the live one)."""
+        while len(self._session_targets) > keep:
+            oldest = next((s for s in self._session_targets if s != self.session), None)
+            if oldest is None:
+                break
+            self._session_targets.pop(oldest)
 
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
@@ -810,7 +843,8 @@ class Daemon:
             async with self._session_state_lock:
                 old_session = self.session
                 self.session = req.get("session_id")
-                self.target_id = req.get("target_id") or self.target_id
+                # The tab is the one the session was attached to, when the daemon saw that attach.
+                self.target_id = self._session_targets.get(self.session) or req.get("target_id") or self.target_id
                 new_session = self.session
             # Run the old-session Network.disable (defense in depth — keeps
             # background-tab traffic out of the global event buffer; the
@@ -877,8 +911,13 @@ class Daemon:
         # For everything else, explicit session in req wins; else default.
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         acts_on, known = self._acts_on(req, method, params, sid)
-        if known and acts_on not in self.owned and not req.get("allow_user_tabs"):
-            return {"error": self._refused(acts_on)}
+        task = req.get("task")
+        if known and not req.get("allow_user_tabs"):
+            if acts_on is None:
+                return {"error": f"refused: session {sid} is not one the harness attached; use switch_tab() or new_tab()"}
+            refusal = self._may_act(acts_on, task)
+            if refusal:
+                return {"error": refusal}
         try:
             result = await self.cdp.send_raw(method, params, session_id=sid)
             if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
@@ -886,12 +925,13 @@ class Daemon:
             elif method == "Target.attachToTarget" and isinstance(result, dict) and result.get("sessionId"):
                 # An iframe target inside an owned tab is that tab's work (js(..., target_id=iframe_target(...))).
                 self._session_targets[result["sessionId"]] = await self._owning_page(params.get("targetId"))
-                while len(self._session_targets) > 64:
-                    self._session_targets.pop(next(iter(self._session_targets)))
+                self._trim_session_targets()
             elif method == "Target.closeTarget":
                 self.disown(acts_on)
             elif method == "Page.navigate" and acts_on in self.owned:
-                self.own(acts_on, url=params.get("url", ""))
+                # The daemon's scratch tab becomes the task's once a task sends it somewhere.
+                claim = task if task and self.owned[acts_on].get("task") == "daemon" else None
+                self.own(acts_on, task=claim, url=params.get("url", ""))
             return {"result": result}
         except Exception as e:
             msg = str(e)
@@ -903,6 +943,7 @@ class Daemon:
                 recovery_task = self._begin_recovery()
                 if recovery_task is None:
                     return {"error": "daemon is shutting down"}
+                meant_for = self._session_targets.get(sid) or self.target_id
                 try:
                     recovered_here = False
                     async with self._session_state_lock:
@@ -924,8 +965,15 @@ class Daemon:
                     # user deliberately switched tabs while this request waited.
                     if replacement_session:
                         landed_on = self._session_targets.get(replacement_session)
-                        if landed_on is not None and landed_on not in self.owned and not req.get("allow_user_tabs"):
-                            return {"error": self._refused(landed_on)}
+                        # Replay only on the very tab the request was meant for. When that tab is gone the
+                        # daemon re-attached elsewhere (another task's tab, its scratch tab): running the
+                        # pending read or click there would act on a page the caller never chose.
+                        if meant_for is not None and landed_on != meant_for:
+                            return {"error": (f"refused: tab {meant_for} was closed; nothing was run. "
+                                              "Open your own with new_tab(url)")}
+                        refusal = None if req.get("allow_user_tabs") or landed_on is None else self._may_act(landed_on, task)
+                        if refusal:
+                            return {"error": refusal}
                         try:
                             return {"result": await self.cdp.send_raw(
                                 method, params, session_id=replacement_session

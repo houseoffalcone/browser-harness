@@ -388,6 +388,10 @@ def list_tabs(include_chrome=True):
         })
     return out
 
+def _my_tabs():
+    """This task's tabs plus the daemon's own scratch tab: the only tabs this task may act on."""
+    return [t for t in owned_tabs(None) if t.get("task") in (TASK, "daemon")]
+
 def owned_tabs(task=TASK):
     """Tabs the harness opened that are still open, with their current url/title and the urls the
     harness sent them to. Defaults to this task (BH_TASK); task=None lists every task's tabs."""
@@ -458,7 +462,7 @@ def new_tab(url="about:blank", reuse=True):
     close_task_tabs() closes at the end."""
     if reuse:
         same_site = [t for t in owned_tabs() if url != "about:blank" and _host(t["url"]) == _host(url)]
-        blank = [t for t in owned_tabs(None) if _is_blankish(t["url"])]
+        blank = [t for t in _my_tabs() if _is_blankish(t["url"])]
         pick = (same_site or blank or [None])[-1]
         if pick:
             _send({"meta": "own_tab", "target_id": pick["targetId"], "task": TASK})
@@ -504,8 +508,9 @@ def close_task_tabs(task=TASK):
 
 def ensure_real_tab():
     """Attach to a tab the harness owns: the current one if it is a real owned page, else the newest
-    owned real page, else a fresh background tab registered to BH_TASK. Never a tab the user opened."""
-    mine = owned_tabs(None)
+    owned real page, else a fresh background tab registered to BH_TASK. Never a tab the user opened,
+    never another task's tab."""
+    mine = _my_tabs()
     try:
         cur = current_tab()
         if cur["url"] and not cur["url"].startswith(INTERNAL) and any(t["targetId"] == cur["targetId"] for t in mine):

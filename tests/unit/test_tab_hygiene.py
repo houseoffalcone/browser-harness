@@ -97,13 +97,18 @@ def test_browser_level_calls_pass_regardless_of_ownership():
     assert "result" in _handle(d, {"method": "Target.getTargets", "params": {}})
 
 
-def test_explicit_session_on_a_known_user_tab_is_refused_unknown_sessions_pass():
+def test_explicit_session_on_a_known_user_tab_is_refused_and_unknown_sessions_too():
     d = _daemon(current="mine")
     d.own("mine")
     _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "user-tab", "flatten": True}})
     r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "session_id": "session-for-user-tab"})
     assert "refused" in r["error"]
-    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "session_id": "iframe-session"})
+    # A session the daemon never attached cannot be told apart from a user's tab: fail closed.
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "session_id": "never-seen"})
+    assert "refused" in r["error"] and "never-seen" in r["error"]
+    assert not any(m == "Runtime.evaluate" for m, _p, _s in d.cdp.calls)
+    _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "mine", "flatten": True}})
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "session_id": "session-for-mine"})
     assert r == {"result": {"value": "1"}}
 
 
@@ -189,7 +194,7 @@ def test_daemon_does_not_own_a_users_blank_or_new_tab_page_but_owns_cloud_pages(
     monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
     d = _daemon(targets=[{"targetId": "user-blank", "url": "chrome://newtab/", "type": "page"}])
     asyncio.run(d.attach_first_page())
-    assert d.target_id == "user-blank" and "user-blank" not in d.owned
+    assert d.target_id == "created-1" and "user-blank" not in d.owned  # local: never the user's tab, not even a blank one
     monkeypatch.setattr(daemon, "REMOTE_ID", "cloud-browser")
     monkeypatch.setattr(daemon, "BROWSER_KIND", "cloud")
     d = _daemon(targets=[{"targetId": "cloud-blank", "url": "about:blank", "type": "page"}])
@@ -198,8 +203,8 @@ def test_daemon_does_not_own_a_users_blank_or_new_tab_page_but_owns_cloud_pages(
 
 
 def test_recovery_never_replays_a_request_on_a_users_page(monkeypatch):
-    """The owned tab was closed; the only page left is the user's. Recovery may attach
-    there (nothing else exists) but the pending click/JS must not run on it."""
+    """The owned tab was closed; the only page left is the user's. Recovery opens its own
+    scratch tab (never the user's) and the pending click/JS runs nowhere: its tab is gone."""
     monkeypatch.setattr(daemon, "NAME", "default")
     monkeypatch.setattr(daemon, "REMOTE_ID", None)
     monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
@@ -215,9 +220,10 @@ def test_recovery_never_replays_a_request_on_a_users_page(monkeypatch):
     d.cdp = _StaleCDP(d.cdp.targets)
     d.own("mine-closed")
     r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "click()"}})
-    assert "refused" in r["error"] and "user-tab" in r["error"]
-    assert d.target_id == "user-tab"
-    assert not any(m == "Runtime.evaluate" and s == "session-for-user-tab" for m, _p, s in d.cdp.calls)
+    assert "refused" in r["error"] and "mine-closed" in r["error"] and "closed" in r["error"]
+    assert d.target_id == "created-1"
+    assert not any(m == "Target.attachToTarget" and p.get("targetId") == "user-tab" for m, p, _s in d.cdp.calls)
+    assert [s for m, _p, s in d.cdp.calls if m == "Runtime.evaluate"] == ["session-current"]  # only the stale try
 
 
 def test_daemon_owns_the_blank_tab_it_creates_but_not_a_users_page(monkeypatch):
@@ -229,7 +235,7 @@ def test_daemon_owns_the_blank_tab_it_creates_but_not_a_users_page(monkeypatch):
     assert "created-1" in d.owned
     d2 = _daemon(targets=[{"targetId": "user-tab", "url": "https://user/", "type": "page"}])
     asyncio.run(d2.attach_first_page())
-    assert d2.target_id == "user-tab" and "user-tab" not in d2.owned
+    assert d2.target_id == "created-1" and "user-tab" not in d2.owned
 
 
 # --- helpers ---
@@ -311,10 +317,26 @@ def test_ensure_real_tab_never_attaches_to_a_users_tab(monkeypatch):
 
 def test_ensure_real_tab_keeps_the_current_tab_when_owned(monkeypatch):
     calls = []
-    _fake_helpers(monkeypatch, [{"targetId": "mine", "url": "https://mine/", "task": "any", "urls": []}], calls)
+    _fake_helpers(monkeypatch, [{"targetId": "mine", "url": "https://mine/", "task": helpers.TASK, "urls": []}], calls)
     monkeypatch.setattr(helpers, "current_tab", lambda: {"targetId": "mine", "url": "https://mine/", "title": ""})
     assert helpers.ensure_real_tab()["targetId"] == "mine"
     assert calls == []
+
+
+def test_ensure_real_tab_and_blank_reuse_never_take_another_tasks_tab(monkeypatch):
+    calls = []
+    other = [{"targetId": "theirs", "url": "https://3dlook/", "task": "other-task", "urls": []},
+             {"targetId": "their-blank", "url": "about:blank", "task": "other-task", "urls": []}]
+    real_new_tab = helpers.new_tab
+    _fake_helpers(monkeypatch, other, calls)
+    monkeypatch.setattr(helpers, "current_tab", lambda: {"targetId": "theirs", "url": "https://3dlook/", "title": ""})
+    monkeypatch.setattr(helpers, "new_tab", lambda url="about:blank", reuse=True: calls.append(("new_tab", url)) or "fresh")
+    assert helpers.ensure_real_tab()["targetId"] == "fresh"
+    assert not any(c[0] == "switch_tab" for c in calls)
+    calls.clear()
+    monkeypatch.setattr(helpers, "new_tab", real_new_tab)
+    assert helpers.new_tab("https://example.com/") == "created"  # their blank tab is not reused
+    assert not any(c[0] == "ipc" and c[1].get("meta") == "own_tab" for c in calls)
 
 
 def test_list_tabs_marks_the_tabs_the_harness_owns(monkeypatch):
@@ -379,3 +401,79 @@ def test_prefer_dedicated_chrome_disabled_by_empty_url(monkeypatch):
     monkeypatch.setenv("BH_PREFER_CDP_URL", "")
     monkeypatch.setattr(run, "_devtools_alive", lambda url: (_ for _ in ()).throw(AssertionError("must not probe")))
     assert run._prefer_dedicated_chrome() is None
+
+
+# --- tasks sharing one daemon (2026-11-24: a 3DLook worker read another task's tab) ---
+
+def _stale_daemon(monkeypatch, targets, current):
+    monkeypatch.setattr(daemon, "NAME", "default")
+    monkeypatch.setattr(daemon, "REMOTE_ID", None)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
+
+    class _StaleCDP(_CDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            if method == "Runtime.evaluate" and session_id == "session-current":
+                self.calls.append((method, params, session_id))
+                raise RuntimeError("Session with given id not found")
+            return await super().send_raw(method, params, session_id)
+
+    d = _daemon(targets=targets, current=current)
+    d.cdp = _StaleCDP(d.cdp.targets)
+    return d
+
+
+def test_a_closed_tab_never_replays_the_read_on_another_tasks_tab(monkeypatch):
+    """The reproduction: tasks A and B share the default daemon; B's tab is closed mid-task;
+    B's next read used to re-attach to A's tab (owned by the daemon) and return A's page."""
+    d = _stale_daemon(monkeypatch, [{"targetId": "a-tab", "url": "https://3dlook/a", "type": "page"}], current="b-closed")
+    d.own("a-tab", task="taskA")
+    d.own("b-closed", task="taskB")
+    d._session_targets["session-current"] = "b-closed"
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "document.title"}, "task": "taskB"})
+    assert "refused" in r["error"] and "b-closed" in r["error"] and "closed" in r["error"]
+    assert not any(m == "Runtime.evaluate" and s == "session-for-a-tab" for m, _p, s in d.cdp.calls)
+    assert d.target_id != "a-tab"  # recovery parks on the daemon's own scratch tab, not A's
+    later = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB",
+                        "session_id": "session-for-a-tab"})
+    assert "refused" in later["error"]
+
+
+def test_guard_is_per_task_and_the_daemon_scratch_tab_is_shared(monkeypatch):
+    d = _daemon(current="a-tab")
+    d.own("a-tab", task="taskA")
+    d.own("scratch")  # task "daemon"
+    assert "result" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskA"})
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})
+    assert "refused" in r["error"] and "taskA" in r["error"]
+    assert "refused" in _handle(d, {"method": "Target.closeTarget", "params": {"targetId": "a-tab"}, "task": "taskB"})["error"]
+    d.target_id = "scratch"
+    assert "result" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})
+    d.target_id = "a-tab"  # a request with no task (older helpers) keeps the daemon-wide rule
+    assert "result" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}})
+
+
+def test_navigating_the_scratch_tab_makes_it_the_tasks(monkeypatch):
+    d = _daemon(current="scratch")
+    d.own("scratch")
+    assert "result" in _handle(d, {"method": "Page.navigate", "params": {"url": "https://a/"}, "task": "taskA"})
+    assert d.owned["scratch"]["task"] == "taskA"
+    assert "refused" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})["error"]
+
+
+def test_set_session_takes_the_tab_from_the_session_it_names(monkeypatch):
+    d = _daemon(current="mine")
+    d.own("mine")
+    _handle(d, {"method": "Target.attachToTarget", "params": {"targetId": "user-tab", "flatten": True}})
+    _handle(d, {"meta": "set_session", "session_id": "session-for-user-tab"})  # no target_id given
+    assert d.target_id == "user-tab"
+    assert "refused" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}})["error"]
+
+
+def test_session_map_trim_keeps_the_current_session():
+    d = _daemon(current="mine")
+    d.session = "live"
+    d._session_targets["live"] = "mine"
+    for i in range(300):
+        d._session_targets[f"s{i}"] = "mine"
+    d._trim_session_targets()
+    assert len(d._session_targets) == 256 and d._session_targets["live"] == "mine"

@@ -471,8 +471,10 @@ def test_named_daemon_creates_dedicated_tab(monkeypatch):
     assert enabled == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}
 
 
-def test_default_daemon_still_attaches_first_page(monkeypatch):
-    """The default daemon keeps reusing the user's first real page."""
+def test_default_daemon_on_a_local_chrome_never_attaches_the_users_page(monkeypatch):
+    """A local Chrome is the user's: the default daemon opens its own scratch tab (closed at
+    shutdown) instead of attaching to the user's first page, which would stream that tab's
+    network events into the daemon."""
     monkeypatch.setattr(daemon, "NAME", "default")
     monkeypatch.setattr(daemon, "REMOTE_ID", None)
     existing = [{"targetId": "user-tab", "url": "https://example.com/", "type": "page"}]
@@ -481,9 +483,10 @@ def test_default_daemon_still_attaches_first_page(monkeypatch):
 
     page = asyncio.run(d.attach_first_page())
 
-    assert page["targetId"] == "user-tab"
-    assert d.dedicated_target_id is None
-    assert d.cdp.created == 0
+    assert page["targetId"] == "created-1"
+    assert d.dedicated_target_id == "created-1"
+    assert d.owned["created-1"]["task"] == "daemon"
+    assert not any(m == "Target.attachToTarget" and p["targetId"] == "user-tab" for m, p, _s in d.cdp.calls)
 
 
 def test_default_daemon_creates_missing_page_in_background(monkeypatch):
@@ -837,6 +840,8 @@ def test_explicit_stale_session_is_not_redirected():
     d = daemon.Daemon()
     d.cdp = _AlwaysStaleCDP()
     d.session = "current-session"
+    d.own("mine")
+    d._session_targets["explicit-stale-session"] = "mine"  # a session the daemon attached to its own tab
 
     result = asyncio.run(d.handle({
         "method": "Runtime.evaluate",
