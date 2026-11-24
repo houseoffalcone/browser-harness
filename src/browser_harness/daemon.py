@@ -742,8 +742,7 @@ class Daemon:
         live = {t["targetId"] for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
                 if t["type"] == "page"}
         if tid not in live:
-            if self._task_target.get(task) == tid:
-                self._task_target.pop(task, None)
+            self.disown(tid)  # same as a pruned tab: the task's retries are refused too, not redirected
             return {"error": f"refused: tab {tid} was closed; nothing was run. Open your own with new_tab(url)"}
         async with self._task_locks.setdefault(task, asyncio.Lock()):
             fresh = self._target_session.get(tid) or await self._attach_tab(tid)
@@ -756,9 +755,18 @@ class Daemon:
             return {"error": str(e)}
 
     async def _view(self, req):
-        """(session, tab) a status request answers for: the asking task's own tab, else the daemon's."""
-        sid, tid = await self._task_tab(req.get("task"))
-        return (sid, tid) if sid else (self.session, self.target_id)
+        """(session, tab) a status request answers for: the asking task's own tab; for a task with no
+        tab, only the daemon's scratch tab; never another task's tab. (None, None) = nothing to show."""
+        task = req.get("task")
+        sid, tid = await self._task_tab(task)
+        if sid:
+            return sid, tid
+        if tid:  # its tab was closed
+            return None, None
+        if not task:
+            return self.session, self.target_id
+        owner = self.owned.get(self.target_id, {}).get("task")
+        return (self.session, self.target_id) if owner == "daemon" else (None, None)
 
     async def _attach_tab(self, tid):
         """A fresh session on tab tid, recorded and with the default domains on."""
@@ -895,10 +903,12 @@ class Daemon:
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
         if meta == "drain_events":
-            view_sid, _vt = await self._view(req) if req.get("task") else (None, None)
-            if view_sid is None or view_sid == self.session and not self._task_target:
+            if not req.get("task"):  # older helpers: the whole buffer, as before
                 out = list(self.events); self.events.clear()
                 return {"events": out}
+            view_sid, _vt = await self._view(req)
+            if view_sid is None:
+                return {"events": []}
             # Tasks share one buffer: take only this task's session's events, leave the rest for theirs.
             out = [e for e in self.events if e.get("session_id") == view_sid]
             keep = [e for e in self.events if e.get("session_id") != view_sid]

@@ -697,3 +697,36 @@ def test_switching_tabs_never_disables_network_on_another_tasks_session():
     d._session_targets["sess-b2"] = "b-tab"
     _handle(d, {"meta": "set_session", "session_id": "sess-b2", "task": "taskB"})
     assert ("Network.disable", None, "session-for-a-tab") not in d.cdp.calls
+
+
+# --- Codex round 5 (PR #3) ---
+
+def test_a_tab_found_closed_by_recovery_keeps_refusing_the_retry(monkeypatch):
+    d = _two_tasks()
+    d._target_session["b-tab"] = "b-stale"; d._session_targets["b-stale"] = "b-tab"; d._task_target["taskB"] = "b-tab"
+    d.cdp.targets[:] = [t for t in d.cdp.targets if t["targetId"] != "b-tab"]
+
+    class _StaleB(_YieldingCDP):
+        async def send_raw(self, method, params=None, session_id=None):
+            if session_id == "b-stale":
+                raise RuntimeError("Session with given id not found")
+            return await super().send_raw(method, params, session_id)
+    d.cdp = _StaleB(d.cdp.targets)
+    for _ in range(2):  # the first try and the retry
+        r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})
+        assert "closed" in r["error"]
+    assert not any(m == "Runtime.evaluate" and s != "b-stale" for m, _p, s in d.cdp.calls)
+
+
+def test_a_task_without_a_tab_never_sees_another_tasks_session():
+    d = _two_tasks()
+    asyncio.run(d._task_tab("taskA"))
+    d.session, d.target_id = "session-for-a-tab", "a-tab"  # the global session sits on A's tab
+    d._record_event("Network.requestWillBeSent", {"requestId": "a1"}, "session-for-a-tab")
+    d._record_event("Page.javascriptDialogOpening", {"message": "A's"}, "session-for-a-tab")
+    assert _handle(d, {"meta": "drain_events", "task": "fresh"})["events"] == []
+    assert _handle(d, {"meta": "pending_dialog", "task": "fresh"})["dialog"] is None
+    assert _handle(d, {"meta": "session", "task": "fresh"})["session_id"] is None
+    assert len(d.events) == 2
+    d.session, d.target_id = "session-current", "scratch"  # on the scratch tab a tab-less task may look
+    assert _handle(d, {"meta": "session", "task": "fresh"})["session_id"] == "session-current"
