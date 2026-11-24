@@ -756,3 +756,15 @@ def test_the_title_marker_goes_on_the_tab_that_loaded():
     d = asyncio.run(run())
     marks = [s for m, p, s in d.cdp.calls if m == "Runtime.evaluate" and p.get("expression") == daemon.TAB_MARKER_JS]
     assert marks == ["session-for-a-tab"]
+
+
+# --- Codex round 7 (PR #3): two agents without BH_TASK are still two owners ---
+
+def test_default_task_is_per_agent_session():
+    assert helpers._default_task({"BH_TASK": "mine", "CLAUDE_CODE_SESSION_ID": "x"}) == "mine"
+    a = helpers._default_task({"CLAUDE_CODE_SESSION_ID": "s-a", "ORCA_TERMINAL_HANDLE": "term_1"})
+    b = helpers._default_task({"CLAUDE_CODE_SESSION_ID": "s-b", "ORCA_TERMINAL_HANDLE": "term_1"})
+    assert a == "claude:s-a" and b == "claude:s-b" and a != b
+    assert helpers._default_task({"ORCA_TERMINAL_HANDLE": "term_9"}) == "orca:term_9"
+    assert helpers._default_task({"CODEX_THREAD_ID": "t1"}) == "codex:t1"
+    assert helpers._default_task({}) == "default"

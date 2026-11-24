@@ -39,7 +39,19 @@ NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 # Tabs the harness opens are registered to this task; close_task_tabs() closes them at the end.
-TASK = os.environ.get("BH_TASK", "default")
+def _default_task(env=os.environ):
+    """BH_TASK when set. Otherwise one owner per agent session, stable across that session's many
+    browser-harness calls: the Claude Code session, else the Orca terminal; "default" only for a plain
+    terminal. Two agents that never set BH_TASK must not share each other's tabs."""
+    if env.get("BH_TASK"):
+        return env["BH_TASK"]
+    for key, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), ("ORCA_TERMINAL_HANDLE", "orca"),
+                        ("CODEX_THREAD_ID", "codex")):
+        if env.get(key):
+            return f"{prefix}:{env[key]}"
+    return "default"
+
+TASK = _default_task()
 # The daemon refuses to act on a tab the harness did not open unless this is set.
 ALLOW_USER_TABS = os.environ.get("BH_ALLOW_USER_TABS", "").strip().lower() in {"1", "true", "yes", "on"}
 BLANK_URLS = ("", "about:blank", "data:text/html,")
