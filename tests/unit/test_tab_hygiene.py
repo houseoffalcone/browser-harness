@@ -537,3 +537,47 @@ def test_restart_reuses_the_left_scratch_tab_and_still_closes_it(monkeypatch):
     d.own("left")
     asyncio.run(d.attach_first_page())
     assert d.target_id == "left" and d.dedicated_target_id == "left" and d.cdp.created == 0
+
+
+# --- Codex round 2 (PR #3): each task keeps its own current tab ---
+
+def test_after_another_tasks_recovery_a_task_is_put_back_on_its_own_tab(monkeypatch):
+    d = _stale_daemon(monkeypatch, [{"targetId": "a-tab", "url": "https://3dlook/a", "type": "page"}], current="b-closed")
+    d.own("a-tab", task="taskA"); d.own("b-closed", task="taskB")
+    d._session_targets["session-current"] = "b-closed"
+    d._task_target["taskA"] = "a-tab"
+    assert "closed" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})["error"]
+    assert d.target_id != "a-tab"  # B's recovery parked on the scratch tab
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "document.title"}, "task": "taskA"})
+    assert "result" in r and d.target_id == "a-tab"
+    assert ("Runtime.evaluate", {"expression": "document.title"}, "session-for-a-tab") in d.cdp.calls
+
+
+def test_after_a_restart_a_task_continues_on_its_newest_live_tab():
+    d = _daemon(targets=[{"targetId": "old", "url": "https://a/1", "type": "page"},
+                         {"targetId": "new", "url": "https://a/2", "type": "page"},
+                         {"targetId": "scratch", "url": "about:blank", "type": "page"}], current="scratch")
+    d.own("scratch")
+    d.own("old", task="taskA"); d.owned["old"]["opened"] = 1
+    d.own("new", task="taskA"); d.owned["new"]["opened"] = 2
+    d.own("gone", task="taskA"); d.owned["gone"]["opened"] = 3  # closed while the daemon was down
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskA"})
+    assert "result" in r and d.target_id == "new"
+
+
+def test_a_task_with_no_tab_stays_on_the_scratch_tab_without_extra_calls():
+    d = _daemon(targets=[{"targetId": "scratch", "url": "about:blank", "type": "page"}], current="scratch")
+    d.own("scratch")
+    assert "result" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "solo"})
+    assert [m for m, _p, _s in d.cdp.calls] == ["Runtime.evaluate"]
+
+
+def test_cloud_recovery_never_takes_another_tasks_page(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "default")
+    monkeypatch.setattr(daemon, "REMOTE_ID", "cloud-browser")
+    monkeypatch.setattr(daemon, "BROWSER_KIND", "cloud")
+    d = _daemon(targets=[{"targetId": "a-tab", "url": "https://a/", "type": "page"},
+                         {"targetId": "free", "url": "https://free/", "type": "page"}], current="b-closed")
+    d.own("a-tab", task="taskA")
+    asyncio.run(d.attach_first_page())
+    assert d.target_id == "free"

@@ -457,6 +457,7 @@ class Daemon:
         self._session_replacements = {}
         self.owned = _load_owned()      # targetId -> {task, urls, opened}
         self._session_targets = {}      # sessionId -> targetId, from relayed attachToTarget
+        self._task_target = {}          # task -> the tab it last switched to (each task has its own current tab)
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
@@ -601,7 +602,9 @@ class Daemon:
                 self.dedicated_target_id = pages[0]["targetId"]  # left by an earlier run: still closed at shutdown
         if not pages and REMOTE_ID:
             # A cloud browser is exclusive to this daemon, so its pages are ours to take.
-            pages = [t for t in targets if is_real_page(t)]
+            # ...but a page another task opened stays that task's, even here.
+            pages = [t for t in targets if is_real_page(t)
+                     and self.owned.get(t["targetId"], {}).get("task", "daemon") == "daemon"]
             if not pages:
                 # Fresh browser (ex: BU cloud) starts w about:blank; reuse it
                 pages = [t for t in targets if is_reusable_blank_page(t)]
@@ -690,6 +693,32 @@ class Daemon:
             except Exception as e:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
+
+    async def _follow_task(self, task):
+        """Tasks sharing one daemon each keep their own current tab. Before a request with no explicit
+        session, make the daemon's current tab this task's: the tab it last switched to, else its newest
+        live tab (after a daemon restart). A task with no tab of its own stays where it is (the scratch
+        tab, or a refusal from the guard)."""
+        rec = self.owned.get(self.target_id)
+        if (rec and rec.get("task") == task) or not any(r.get("task") == task for r in self.owned.values()):
+            return
+        live = {t["targetId"] for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
+                if t["type"] == "page"}
+        mine = lambda tid: tid in live and self.owned.get(tid, {}).get("task") == task
+        want = self._task_target.get(task)
+        if not mine(want):
+            own = [tid for tid, r in self.owned.items() if r.get("task") == task and tid in live]
+            want = max(own, key=lambda tid: self.owned[tid].get("opened", 0)) if own else None
+        if want is None or want == self.target_id:
+            return
+        async with self._session_state_lock:
+            session = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": want, "flatten": True}))["sessionId"]
+            self._session_targets[session] = want
+            self.session, self.target_id = session, want
+            self._task_target[task] = want
+            self._trim_session_targets()
+        log(f"task {task}: back on its own tab {want} session={session}")
+        await self._enable_default_domains(session)
 
     def _trim_session_targets(self, keep=256):
         """Bound the session→tab map without ever forgetting the daemon's current session
@@ -857,6 +886,8 @@ class Daemon:
                 self.session = req.get("session_id")
                 # The tab is the one the session was attached to, when the daemon saw that attach.
                 self.target_id = self._session_targets.get(self.session) or req.get("target_id") or self.target_id
+                if req.get("task") and self.target_id:
+                    self._task_target[req["task"]] = self.target_id
                 new_session = self.session
             # Run the old-session Network.disable (defense in depth — keeps
             # background-tab traffic out of the global event buffer; the
@@ -928,6 +959,8 @@ class Daemon:
         params = req.get("params") or {}
         # Browser-level Target.* calls must not use a session (stale or otherwise).
         # For everything else, explicit session in req wins; else default.
+        if not method.startswith("Target.") and not req.get("session_id") and req.get("task"):
+            await self._follow_task(req["task"])
         sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
         acts_on, known = self._acts_on(req, method, params, sid)
         task = req.get("task")
