@@ -39,7 +39,19 @@ NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 # Tabs the harness opens are registered to this task; close_task_tabs() closes them at the end.
-TASK = os.environ.get("BH_TASK", "default")
+def _default_task(env=os.environ):
+    """BH_TASK when set. Otherwise one owner per agent session, stable across that session's many
+    browser-harness calls: the Claude Code session, else the Orca terminal; "default" only for a plain
+    terminal. Two agents that never set BH_TASK must not share each other's tabs."""
+    if env.get("BH_TASK"):
+        return env["BH_TASK"]
+    for key, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), ("ORCA_TERMINAL_HANDLE", "orca"),
+                        ("CODEX_THREAD_ID", "codex")):
+        if env.get(key):
+            return f"{prefix}:{env[key]}"
+    return "default"
+
+TASK = _default_task()
 # The daemon refuses to act on a tab the harness did not open unless this is set.
 ALLOW_USER_TABS = os.environ.get("BH_ALLOW_USER_TABS", "").strip().lower() in {"1", "true", "yes", "on"}
 BLANK_URLS = ("", "about:blank", "data:text/html,")
@@ -56,7 +68,7 @@ class _IPCResponseTimeout(TimeoutError):
 
 
 def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
-    req = {**req, "task": TASK}  # tabs the daemon creates for this call are registered to the task
+    req = {"task": TASK, **req}  # tabs the daemon creates are registered to the task; an explicit task (even None) wins
     if ALLOW_USER_TABS:
         req["allow_user_tabs"] = True
     c, token = ipc.connect(NAME, timeout=IPC_CONNECT_TIMEOUT_SECONDS)
@@ -371,11 +383,14 @@ def _is_agent_startup_placeholder(title, url):
 
 
 def list_tabs(include_chrome=True):
-    """Every page tab. `owned` marks the tabs the harness opened — the only ones it may act on."""
-    owned = {t["targetId"] for t in owned_tabs(None)}
+    """Every page tab except other tasks' tabs (their titles and URLs are theirs). `owned` marks this
+    task's tabs (and the daemon's scratch tab) — the only ones it may act on."""
+    every = owned_tabs(None)
+    owned = {t["targetId"] for t in every if t.get("task") in (TASK, "daemon")}
+    others = {t["targetId"] for t in every} - owned
     out = []
     for t in cdp("Target.getTargets")["targetInfos"]:
-        if t["type"] != "page": continue
+        if t["type"] != "page" or t["targetId"] in others: continue
         url = t.get("url", "")
         if _is_agent_startup_placeholder(t.get("title", ""), url): continue
         if not include_chrome and url.startswith(INTERNAL): continue
@@ -388,10 +403,17 @@ def list_tabs(include_chrome=True):
         })
     return out
 
+def _my_tabs():
+    """This task's tabs plus the daemon's own scratch tab: the only tabs this task may act on."""
+    return [t for t in owned_tabs(None) if t.get("task") in (TASK, "daemon")]
+
 def owned_tabs(task=TASK):
     """Tabs the harness opened that are still open, with their current url/title and the urls the
-    harness sent them to. Defaults to this task (BH_TASK); task=None lists every task's tabs."""
-    return _send({"meta": "owned_tabs", "task": task}).get("tabs", [])
+    harness sent them to. Defaults to this task (BH_TASK); task=None lists every task's tabs, another
+    task's only as {targetId, task} (never its title or URL)."""
+    if task is None:
+        return _send({"meta": "owned_tabs", "task": TASK, "all": True}).get("tabs", [])
+    return _send({"meta": "owned_tabs", "task": TASK, "of": task}).get("tabs", [])
 
 def _host(url):
     return (urlparse(url).hostname or "").removeprefix("www.")
@@ -458,10 +480,14 @@ def new_tab(url="about:blank", reuse=True):
     close_task_tabs() closes at the end."""
     if reuse:
         same_site = [t for t in owned_tabs() if url != "about:blank" and _host(t["url"]) == _host(url)]
-        blank = [t for t in owned_tabs(None) if _is_blankish(t["url"])]
+        blank = [t for t in _my_tabs() if _is_blankish(t["url"])]
         pick = (same_site or blank or [None])[-1]
         if pick:
-            _send({"meta": "own_tab", "target_id": pick["targetId"], "task": TASK})
+            try:
+                _send({"meta": "own_tab", "target_id": pick["targetId"], "task": TASK})
+            except RuntimeError:
+                pick = None  # another task claimed it first: open our own below
+        if pick:
             switch_tab(pick["targetId"])
             if url != "about:blank":
                 goto_url(url)
@@ -504,8 +530,9 @@ def close_task_tabs(task=TASK):
 
 def ensure_real_tab():
     """Attach to a tab the harness owns: the current one if it is a real owned page, else the newest
-    owned real page, else a fresh background tab registered to BH_TASK. Never a tab the user opened."""
-    mine = owned_tabs(None)
+    owned real page, else a fresh background tab registered to BH_TASK. Never a tab the user opened,
+    never another task's tab."""
+    mine = _my_tabs()
     try:
         cur = current_tab()
         if cur["url"] and not cur["url"].startswith(INTERNAL) and any(t["targetId"] == cur["targetId"] for t in mine):

@@ -457,6 +457,11 @@ class Daemon:
         self._session_replacements = {}
         self.owned = _load_owned()      # targetId -> {task, urls, opened}
         self._session_targets = {}      # sessionId -> targetId, from relayed attachToTarget
+        self._task_target = {}          # task -> the tab it last switched to (each task has its own current tab)
+        self._target_session = {}       # tab -> the session the daemon holds on it
+        self._task_locks = {}           # task -> lock, so one task never attaches its tab twice at once
+        self._task_closed = {}          # task -> its last tab, closed (its next request is refused, not redirected)
+        self._dialogs = {}              # session -> the JS dialog open on it
         self.events = deque(maxlen=BUF)
         self.dialog = None
         self.stop = None  # asyncio.Event, set inside start()
@@ -468,12 +473,26 @@ class Daemon:
         rec = self.owned.setdefault(target_id, {"task": task or "daemon", "urls": [], "opened": time.time()})
         if task:
             rec["task"] = task
+            self._task_closed.pop(task, None)  # the task has a tab again
+            if task != "daemon" and target_id == self.dedicated_target_id:
+                # The scratch tab is a task's now: shutdown must not close that task's work.
+                self.dedicated_target_id = None
         if url and url not in rec["urls"]:
             rec["urls"].append(url)
         _save_owned(self.owned)
 
     def disown(self, target_id):
-        if self.owned.pop(target_id, None) is not None:
+        """Forget a tab (closed, or closed by the harness). A task whose last tab this was keeps a note of
+        it, so its next request is refused ("was closed") instead of running on the scratch tab."""
+        self._dialogs.pop(self._target_session.pop(target_id, None), None)
+        for t in [t for t, tid in self._task_target.items() if tid == target_id]:
+            self._task_target.pop(t, None)
+        rec = self.owned.pop(target_id, None)
+        if rec is not None:
+            task = rec.get("task")
+            if task and task != "daemon" and not any(r.get("task") == task for r in self.owned.values()):
+                self._task_closed[task] = target_id
+                self._task_locks.pop(task, None)
             _save_owned(self.owned)
 
     async def owned_live(self, task=None):
@@ -483,9 +502,7 @@ class Daemon:
         live = {t["targetId"]: t for t in targets if t["type"] == "page"}
         gone = [tid for tid in self.owned if tid not in live]
         for tid in gone:
-            self.owned.pop(tid)
-        if gone:
-            _save_owned(self.owned)
+            self.disown(tid)
         return [
             {"targetId": tid, "url": live[tid].get("url", ""), "title": live[tid].get("title", ""), **rec}
             for tid, rec in self.owned.items() if task is None or rec.get("task") == task
@@ -495,6 +512,25 @@ class Daemon:
     def _refused(target_id):
         return (f"refused: tab {target_id} was not opened by the harness. Open your own with "
                 "new_tab(url); set BH_ALLOW_USER_TABS=1 only to act on the user's tabs deliberately")
+
+    @staticmethod
+    def _refused_task(target_id, owner, task):
+        return (f"refused: tab {target_id} belongs to task {owner!r}, not {task!r}. Open your own with "
+                "new_tab(url); tasks sharing one daemon never act on each other's tabs")
+
+    def _may_act(self, target_id, task):
+        """None when this request may act on target_id, else the refusal. A tab is the task's that
+        opened it; a tab still tagged "daemon" (the daemon's own scratch tab) is any task's.
+        Requests without a task (older helpers) keep the daemon-wide rule."""
+        rec = self.owned.get(target_id)
+        if rec is None:
+            if target_id is not None and target_id in self._task_closed.values():
+                return f"refused: tab {target_id} was closed; nothing was run. Open your own with new_tab(url)"
+            return self._refused(target_id)
+        owner = rec.get("task") or "daemon"
+        if task and owner not in (task, "daemon"):
+            return self._refused_task(target_id, owner, task)
+        return None
 
     async def _owning_page(self, tid):
         """The page target a frame target belongs to (walk parentId); tid itself when it is a page or unknown."""
@@ -512,8 +548,8 @@ class Daemon:
         if method.startswith("Target."):
             return None, False  # browser-level
         if req.get("session_id"):
-            tid = self._session_targets.get(sid)
-            return tid, tid is not None
+            # A session the daemon never saw attached (or forgot) cannot be told: refused below, never passed.
+            return self._session_targets.get(sid), True
         return self.target_id, self.target_id is not None
 
     async def attach_first_page(self, replaces_session=None, enable_domains=True):
@@ -573,16 +609,25 @@ class Daemon:
         pages_by_id = {t["targetId"]: t for t in targets if t["type"] == "page"}
         pages = [pages_by_id[self.target_id]] if self.target_id in pages_by_id else []
         if not pages:
-            pages = [t for t in targets if t["targetId"] in self.owned and is_real_page(t)]
-        if not pages:
-            pages = [t for t in targets if is_real_page(t)]
-        if not pages:
-            # Fresh browser (ex: BU cloud) starts w about:blank; reuse it
-            pages = [t for t in targets if is_reusable_blank_page(t)]
-        if not pages:
-            # Freshly launched browser (ex: harness relaunching closed Chrome)
-            # starts with just the New Tab Page. Reuse it — creating about:blank
-            pages = [t for t in targets if is_reusable_new_tab_page(t)]
+            # Only the daemon's own scratch tab: a task's tab is that task's, never a fallback for another.
+            pages = [t for t in targets
+                     if t["targetId"] in self.owned and self.owned[t["targetId"]].get("task") == "daemon"
+                     and t["type"] == "page"]
+            if pages and not REMOTE_ID:
+                self.dedicated_target_id = pages[0]["targetId"]  # left by an earlier run: still closed at shutdown
+        if not pages and REMOTE_ID:
+            # A cloud browser is exclusive to this daemon, so its pages are ours to take.
+            # ...but a page another task opened stays that task's, even here.
+            pages = [t for t in targets if is_real_page(t)
+                     and self.owned.get(t["targetId"], {}).get("task", "daemon") == "daemon"]
+            if not pages:
+                # Fresh browser (ex: BU cloud) starts w about:blank; reuse it
+                pages = [t for t in targets if is_reusable_blank_page(t)]
+            if not pages:
+                # Freshly launched browser starts with just the New Tab Page. Reuse it.
+                pages = [t for t in targets if is_reusable_new_tab_page(t)]
+        # A local Chrome is the user's (or other daemons'): never attach to a tab the harness did not
+        # open, not even to look — attaching streams that tab's network events into this daemon.
         take_over = None
         if not pages and harness_opened_inspect():
             # After perms granted, only tab is often chrome://inspect
@@ -596,9 +641,11 @@ class Daemon:
             tid = (await self.cdp.send_raw(
                 "Target.createTarget", {"url": "about:blank", "background": True}
             ))["targetId"]
-            log(f"no real pages found, created about:blank ({tid})")
+            log(f"no tab of the harness's own, created about:blank ({tid})")
             pages = [{"targetId": tid, "url": "about:blank", "type": "page"}]
             self.own(tid)
+            if not REMOTE_ID:
+                self.dedicated_target_id = tid  # the daemon's scratch tab: closed again at shutdown
         self.session = (await self.cdp.send_raw(
             "Target.attachToTarget", {"targetId": pages[0]["targetId"], "flatten": True}
         ))["sessionId"]
@@ -662,6 +709,102 @@ class Daemon:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
 
+    async def _task_tab(self, task):
+        """(session, tab) of this task's own current tab, or (None, None) when the task has none.
+        Tasks sharing one daemon each keep their own tab: the one the task last switched to, else its
+        newest live tab (after a daemon restart). Never changes the daemon's global session, so
+        concurrent tasks and recoveries cannot pull each other's requests onto the wrong tab."""
+        if not task or not any(r.get("task") == task for r in self.owned.values()):
+            closed = self._task_closed.get(task) if task else None
+            return (None, closed) if closed else (None, None)
+        lock = self._task_locks.setdefault(task, asyncio.Lock())
+        async with lock:
+            tid = self._task_target.get(task)
+            if self.owned.get(tid, {}).get("task") != task:
+                live = {t["targetId"] for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
+                        if t["type"] == "page"}
+                own = [t for t, r in self.owned.items() if r.get("task") == task and t in live]
+                if not own:
+                    # Every tab it had was closed (e.g. while the daemon was down): forget them the same
+                    # way pruning does, so this task is refused rather than sent to the scratch tab.
+                    for t in [t for t, r in self.owned.items() if r.get("task") == task]:
+                        self.disown(t)
+                    closed = self._task_closed.get(task)
+                    return (None, closed) if closed else (None, None)
+                tid = max(own, key=lambda t: self.owned[t].get("opened", 0))
+                self._task_target[task] = tid
+            sid = self._target_session.get(tid)
+            if sid is None:
+                sid = await self._attach_tab(tid)
+            return sid, tid
+
+    async def _recover_task_tab(self, task, tid, stale, method, params):
+        """This task's session on its own tab went stale. The same tab still open: a new session on it
+        and the request once more. The tab gone: nothing runs anywhere else."""
+        if self._target_session.get(tid) == stale:
+            self._target_session.pop(tid, None)
+        self._session_targets.pop(stale, None)
+        live = {t["targetId"] for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
+                if t["type"] == "page"}
+        if tid not in live:
+            self.disown(tid)  # same as a pruned tab: the task's retries are refused too, not redirected
+            return {"error": f"refused: tab {tid} was closed; nothing was run. Open your own with new_tab(url)"}
+        async with self._task_locks.setdefault(task, asyncio.Lock()):
+            fresh = self._target_session.get(tid) or await self._attach_tab(tid)
+        log(f"task {task}: stale session {stale} on its tab {tid}, re-attached {fresh}")
+        if self.session == stale:
+            self.session = fresh
+        try:
+            return {"result": await self.cdp.send_raw(method, params, session_id=fresh)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _view(self, req):
+        """(session, tab) a status request answers for: the asking task's own tab; for a task with no
+        tab, only the daemon's scratch tab; never another task's tab. (None, None) = nothing to show."""
+        task = req.get("task")
+        sid, tid = await self._task_tab(task)
+        if sid:
+            return sid, tid
+        if tid:  # its tab was closed
+            return None, None
+        if not task:
+            return self.session, self.target_id
+        owner = self.owned.get(self.target_id, {}).get("task")
+        return (self.session, self.target_id) if owner == "daemon" else (None, None)
+
+    async def _attach_tab(self, tid):
+        """A fresh session on tab tid, recorded and with the default domains on."""
+        sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+        self._session_targets[sid] = tid
+        self._target_session[tid] = sid
+        self._trim_session_targets()
+        log(f"attached {tid} session={sid}")
+        await self._enable_default_domains(sid)
+        return sid
+
+    def _hide_other_tasks(self, infos, task):
+        """Target.getTargets as one task sees it: another task's tabs (and their iframes) are not listed."""
+        by_id = {t["targetId"]: t for t in infos}
+        def page_of(tid, seen=()):
+            t = by_id.get(tid)
+            if t and t.get("type") != "page" and t.get("parentId") and tid not in seen:
+                return page_of(t["parentId"], seen + (tid,))
+            return tid
+        def theirs(t):
+            owner = self.owned.get(page_of(t["targetId"]), {}).get("task")
+            return owner is not None and owner not in (task, "daemon")
+        return [t for t in infos if not theirs(t)]
+
+    def _trim_session_targets(self, keep=256):
+        """Bound the session→tab map without ever forgetting the daemon's current session
+        (a forgotten session would be refused, so keep the live one)."""
+        while len(self._session_targets) > keep:
+            oldest = next((s for s in self._session_targets if s != self.session), None)
+            if oldest is None:
+                break
+            self._session_targets.pop(oldest)
+
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
         if not stale_session or not replacement_session or stale_session == replacement_session:
@@ -711,8 +854,9 @@ class Daemon:
         return self._recoveries_idle.is_set()
 
     def _schedule_tab_marker(self, session_id):
-        """Mark the controlled tab without extending the synchronous IPC path."""
-        if not tab_marker_enabled() or self.target_id not in self.owned:
+        """Mark the tab of session_id (an owned one) without extending the synchronous IPC path."""
+        tid = self._session_targets.get(session_id) or (self.target_id if session_id == self.session else None)
+        if not tab_marker_enabled() or tid not in self.owned:
             return None
         return asyncio.create_task(_silent(asyncio.wait_for(
             self.cdp.send_raw(
@@ -727,10 +871,12 @@ class Daemon:
         self.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             self.dialog = params
+            self._dialogs[session_id] = params
         elif method == "Page.javascriptDialogClosed":
             self.dialog = None
+            self._dialogs.pop(session_id, None)
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
-            self._schedule_tab_marker(self.session)
+            self._schedule_tab_marker(session_id or self.session)
 
     async def start(self):
         self.stop = asyncio.Event()
@@ -776,26 +922,37 @@ class Daemon:
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":        return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND}
         if meta == "drain_events":
-            out = list(self.events); self.events.clear()
+            if not req.get("task"):  # older helpers: the whole buffer, as before
+                out = list(self.events); self.events.clear()
+                return {"events": out}
+            view_sid, _vt = await self._view(req)
+            if view_sid is None:
+                return {"events": []}
+            # Tasks share one buffer: take only this task's session's events, leave the rest for theirs.
+            out = [e for e in self.events if e.get("session_id") == view_sid]
+            keep = [e for e in self.events if e.get("session_id") != view_sid]
+            self.events.clear(); self.events.extend(keep)
             return {"events": out}
-        if meta == "session":     return {"session_id": self.session}
+        if meta == "session":     return {"session_id": (await self._view(req))[0]}
         if meta == "current_tab":
             # Resolve the attached page's target info server-side. Helpers can't
             # send Target.getTargetInfo themselves: daemon strips session_id for
             # any Target.* method (browser-level call), and without a targetId
             # Chrome silently returns the *browser* target.
-            if not self.target_id:
+            _vs, view_tid = await self._view(req)
+            if not view_tid:
                 return {"error": "not_attached"}
             try:
-                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
+                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": view_tid}))["targetInfo"]
             except Exception:
                 return {"error": "cdp_disconnected"}
             return {"targetId": info.get("targetId"), "url": info.get("url", ""), "title": info.get("title", "")}
         if meta == "connection_status":
-            if not self.target_id:
+            view_sid, view_tid = await self._view(req)
+            if not view_tid:
                 return {"error": "not_attached"}
             try:
-                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": self.target_id}))["targetInfo"]
+                info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": view_tid}))["targetInfo"]
             except Exception:
                 return {"error": "cdp_disconnected"}
             page = None
@@ -805,12 +962,24 @@ class Daemon:
                     "title": info.get("title") or "(untitled)",
                     "url": info.get("url") or "",
                 }
-            return {"target_id": self.target_id, "session_id": self.session, "page": page}
+            return {"target_id": view_tid, "session_id": view_sid, "page": page}
         if meta == "set_session":
+            tid = self._session_targets.get(req.get("session_id"))
+            if not req.get("allow_user_tabs"):
+                if tid is None:
+                    return {"error": f"refused: session {req.get('session_id')} is not one the harness attached"}
+                refusal = self._may_act(tid, req.get("task"))
+                if refusal:
+                    return {"error": refusal}
             async with self._session_state_lock:
                 old_session = self.session
                 self.session = req.get("session_id")
-                self.target_id = req.get("target_id") or self.target_id
+                # The tab is the one the session was attached to, when the daemon saw that attach.
+                self.target_id = self._session_targets.get(self.session) or req.get("target_id") or self.target_id
+                if req.get("task") and self.target_id:
+                    self._task_target[req["task"]] = self.target_id
+                if self.session and self.target_id:
+                    self._target_session[self.target_id] = self.session
                 new_session = self.session
             # Run the old-session Network.disable (defense in depth — keeps
             # background-tab traffic out of the global event buffer; the
@@ -821,7 +990,8 @@ class Daemon:
             # even on a remote daemon — sequentially these would have stacked
             # to ~22s worst case.
             tasks = []
-            if old_session and old_session != new_session:
+            in_use = {self._target_session.get(t) for k, t in self._task_target.items() if k != req.get("task")}
+            if old_session and old_session != new_session and old_session not in in_use:
                 async def disable_old():
                     try:
                         await asyncio.wait_for(
@@ -836,16 +1006,32 @@ class Daemon:
             # it doesn't add to the synchronous IPC budget.
             self._schedule_tab_marker(new_session)
             return {"session_id": new_session}
-        if meta == "pending_dialog": return {"dialog": self.dialog}
+        if meta == "pending_dialog":
+            view_sid, _vt = await self._view(req)
+            return {"dialog": self._dialogs.get(view_sid) if req.get("task") else self.dialog}
         if meta == "own_tab":
-            self.own(req.get("target_id"), task=req.get("task"), url=req.get("url", ""))
+            # Claim only a tab already this task's or the daemon's scratch tab: never a user's tab, and
+            # never another task's (two tasks racing for the scratch tab: the second is refused).
+            tid = req.get("target_id")
+            if not req.get("allow_user_tabs"):
+                refusal = self._may_act(tid, req.get("task"))
+                if refusal:
+                    return {"error": refusal}
+            self.own(tid, task=req.get("task"), url=req.get("url", ""))
             return {"ok": True}
         if meta == "disown_tab":
             self.disown(req.get("target_id"))
             return {"ok": True}
         if meta == "owned_tabs":
             try:
-                return {"tabs": await self.owned_live(req.get("task"))}
+                asker = req.get("task")
+                of = None if req.get("all") else req.get("of", asker)
+                tabs = await self.owned_live(of)
+                if not asker:  # older helpers: as before
+                    return {"tabs": tabs}
+                # Every task's tabs, but another task's only as an id and owner: never its title or URL.
+                return {"tabs": [t if t.get("task") in (asker, "daemon") else {"targetId": t["targetId"], "task": t.get("task")}
+                                 for t in tabs]}
             except Exception:
                 return {"error": "cdp_disconnected"}
         if meta == "shutdown":
@@ -875,26 +1061,57 @@ class Daemon:
         params = req.get("params") or {}
         # Browser-level Target.* calls must not use a session (stale or otherwise).
         # For everything else, explicit session in req wins; else default.
-        sid = None if method.startswith("Target.") else (req.get("session_id") or self.session)
-        acts_on, known = self._acts_on(req, method, params, sid)
-        if known and acts_on not in self.owned and not req.get("allow_user_tabs"):
-            return {"error": self._refused(acts_on)}
+        task = req.get("task")
+        # A task that has a tab of its own works on that tab, through its own session: never through
+        # the daemon's global session, which other tasks (and recovery) may move at any moment.
+        task_sid = task_tid = None
+        if not method.startswith("Target.") and not req.get("session_id"):
+            task_sid, task_tid = await self._task_tab(task)
+        sid = None if method.startswith("Target.") else (req.get("session_id") or task_sid or self.session)
+        if task_tid and not task_sid and not req.get("allow_user_tabs"):
+            return {"error": f"refused: tab {task_tid} was closed; nothing was run. Open your own with new_tab(url)"}
+        acts_on, known = (task_tid, True) if task_sid else self._acts_on(req, method, params, sid)
+        if (method.startswith("Target.") and isinstance(params.get("targetId"), str) and task
+                and not req.get("allow_user_tabs")):
+            # Any browser-level call naming a tab (getTargetInfo, close, activate, attach, ...): never
+            # one of another task's tabs (or an iframe inside one), not even to read its title or URL.
+            page = await self._owning_page(params["targetId"])
+            owner = self.owned.get(page, {}).get("task")
+            if owner is not None and owner not in (task, "daemon"):
+                return {"error": self._refused_task(page, owner, task)}
+        if method == "Target.attachToTarget" and not req.get("allow_user_tabs"):
+            # Attaching is already acting (it can enable Page/DOM/Runtime/Network on the tab): only a
+            # tab of this task, or an iframe inside one.
+            refusal = self._may_act(await self._owning_page(params.get("targetId")), task)
+            if refusal:
+                return {"error": refusal}
+        if known and not req.get("allow_user_tabs"):
+            if acts_on is None:
+                return {"error": f"refused: session {sid} is not one the harness attached; use switch_tab() or new_tab()"}
+            refusal = self._may_act(acts_on, task)
+            if refusal:
+                return {"error": refusal}
         try:
             result = await self.cdp.send_raw(method, params, session_id=sid)
+            if method == "Target.getTargets" and task and isinstance(result, dict) and not req.get("allow_user_tabs"):
+                result = {**result, "targetInfos": self._hide_other_tasks(result.get("targetInfos", []), task)}
             if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
                 self.own(result["targetId"], task=req.get("task"), url=params.get("url", ""))
             elif method == "Target.attachToTarget" and isinstance(result, dict) and result.get("sessionId"):
                 # An iframe target inside an owned tab is that tab's work (js(..., target_id=iframe_target(...))).
                 self._session_targets[result["sessionId"]] = await self._owning_page(params.get("targetId"))
-                while len(self._session_targets) > 64:
-                    self._session_targets.pop(next(iter(self._session_targets)))
+                self._trim_session_targets()
             elif method == "Target.closeTarget":
                 self.disown(acts_on)
             elif method == "Page.navigate" and acts_on in self.owned:
-                self.own(acts_on, url=params.get("url", ""))
+                # The daemon's scratch tab becomes the task's once a task sends it somewhere.
+                claim = task if task and self.owned[acts_on].get("task") == "daemon" else None
+                self.own(acts_on, task=claim, url=params.get("url", ""))
             return {"result": result}
         except Exception as e:
             msg = str(e)
+            if "Session with given id not found" in msg and task_sid and sid == task_sid:
+                return await self._recover_task_tab(task, task_tid, sid, method, params)
             if "Session with given id not found" in msg and sid:
                 # Explicit session callers asked for that exact session; do not
                 # silently redirect them to the daemon's current tab.
@@ -903,6 +1120,7 @@ class Daemon:
                 recovery_task = self._begin_recovery()
                 if recovery_task is None:
                     return {"error": "daemon is shutting down"}
+                meant_for = self._session_targets.get(sid) or self.target_id
                 try:
                     recovered_here = False
                     async with self._session_state_lock:
@@ -924,8 +1142,15 @@ class Daemon:
                     # user deliberately switched tabs while this request waited.
                     if replacement_session:
                         landed_on = self._session_targets.get(replacement_session)
-                        if landed_on is not None and landed_on not in self.owned and not req.get("allow_user_tabs"):
-                            return {"error": self._refused(landed_on)}
+                        # Replay only on the very tab the request was meant for. When that tab is gone the
+                        # daemon re-attached elsewhere (another task's tab, its scratch tab): running the
+                        # pending read or click there would act on a page the caller never chose.
+                        if meant_for is not None and landed_on != meant_for:
+                            return {"error": (f"refused: tab {meant_for} was closed; nothing was run. "
+                                              "Open your own with new_tab(url)")}
+                        refusal = None if req.get("allow_user_tabs") or landed_on is None else self._may_act(landed_on, task)
+                        if refusal:
+                            return {"error": refusal}
                         try:
                             return {"result": await self.cdp.send_raw(
                                 method, params, session_id=replacement_session
