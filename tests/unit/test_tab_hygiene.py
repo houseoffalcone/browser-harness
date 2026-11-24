@@ -152,9 +152,9 @@ def test_raw_create_target_is_owned_with_the_request_task():
 def test_marker_is_never_scheduled_for_a_tab_the_harness_does_not_own():
     async def run():
         d = _daemon(current="user-tab")
-        assert d._schedule_tab_marker("s") is None
+        assert d._schedule_tab_marker(d.session) is None
         d.own("user-tab")
-        task = d._schedule_tab_marker("s")
+        task = d._schedule_tab_marker(d.session)
         await task
         return d
     d = asyncio.run(run())
@@ -440,7 +440,8 @@ def test_a_closed_tab_never_replays_the_read_on_another_tasks_tab(monkeypatch):
 
 
 def test_guard_is_per_task_and_the_daemon_scratch_tab_is_shared(monkeypatch):
-    d = _daemon(current="a-tab")
+    d = _daemon(targets=[{"targetId": "a-tab", "url": "https://a/", "type": "page"},
+                         {"targetId": "scratch", "url": "about:blank", "type": "page"}], current="a-tab")
     d.own("a-tab", task="taskA")
     d.own("scratch")  # task "daemon"
     assert "result" in _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskA"})
@@ -730,3 +731,28 @@ def test_a_task_without_a_tab_never_sees_another_tasks_session():
     assert len(d.events) == 2
     d.session, d.target_id = "session-current", "scratch"  # on the scratch tab a tab-less task may look
     assert _handle(d, {"meta": "session", "task": "fresh"})["session_id"] == "session-current"
+
+
+# --- Codex round 6 (PR #3) ---
+
+def test_a_task_whose_tabs_all_closed_while_the_daemon_was_down_is_refused():
+    d = _two_tasks()
+    d.own("b-gone", task="taskB")
+    d.cdp.targets[:] = [t for t in d.cdp.targets if t["targetId"] != "b-tab"]  # both B tabs gone
+    r = _handle(d, {"method": "Runtime.evaluate", "params": {"expression": "1"}, "task": "taskB"})
+    assert "closed" in r["error"]
+    assert not any(m == "Runtime.evaluate" for m, _p, _s in d.cdp.calls)
+    assert _handle(d, {"meta": "session", "task": "taskB"})["session_id"] is None
+
+
+def test_the_title_marker_goes_on_the_tab_that_loaded():
+    async def run():
+        d = _two_tasks()
+        await d._task_tab("taskA"); await d._task_tab("taskB")
+        d.session, d.target_id = "session-for-b-tab", "b-tab"
+        task = d._schedule_tab_marker("session-for-a-tab")
+        await task
+        return d
+    d = asyncio.run(run())
+    marks = [s for m, p, s in d.cdp.calls if m == "Runtime.evaluate" and p.get("expression") == daemon.TAB_MARKER_JS]
+    assert marks == ["session-for-a-tab"]

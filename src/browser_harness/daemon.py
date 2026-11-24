@@ -725,7 +725,12 @@ class Daemon:
                         if t["type"] == "page"}
                 own = [t for t, r in self.owned.items() if r.get("task") == task and t in live]
                 if not own:
-                    return None, None
+                    # Every tab it had was closed (e.g. while the daemon was down): forget them the same
+                    # way pruning does, so this task is refused rather than sent to the scratch tab.
+                    for t in [t for t, r in self.owned.items() if r.get("task") == task]:
+                        self.disown(t)
+                    closed = self._task_closed.get(task)
+                    return (None, closed) if closed else (None, None)
                 tid = max(own, key=lambda t: self.owned[t].get("opened", 0))
                 self._task_target[task] = tid
             sid = self._target_session.get(tid)
@@ -836,8 +841,9 @@ class Daemon:
         return self._recoveries_idle.is_set()
 
     def _schedule_tab_marker(self, session_id):
-        """Mark the controlled tab without extending the synchronous IPC path."""
-        if not tab_marker_enabled() or self.target_id not in self.owned:
+        """Mark the tab of session_id (an owned one) without extending the synchronous IPC path."""
+        tid = self._session_targets.get(session_id) or (self.target_id if session_id == self.session else None)
+        if not tab_marker_enabled() or tid not in self.owned:
             return None
         return asyncio.create_task(_silent(asyncio.wait_for(
             self.cdp.send_raw(
@@ -857,7 +863,7 @@ class Daemon:
             self.dialog = None
             self._dialogs.pop(session_id, None)
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
-            self._schedule_tab_marker(self.session)
+            self._schedule_tab_marker(session_id or self.session)
 
     async def start(self):
         self.stop = asyncio.Event()
